@@ -246,7 +246,7 @@ def fused_recurrent_linear_attn(
         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
     o, final_state = FusedRecurrentLinearAttentionFunction.apply(q, k, v, scale, initial_state, output_final_state)
     if normalize:
-        o = normalize_output(q * scale, k, o,cum_k)
+        o = normalize_output(q * scale, k, o, cum_k)
     if not head_first:
         o = o.transpose(1, 2)
     return o, final_state
