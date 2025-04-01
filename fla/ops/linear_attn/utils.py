@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 import torch
 
 
-@torch.jit.script
+@torch.compile
 def normalize_output(q, k, o, cum_k=None):
     k = k.cumsum(-2)
     if cum_k is not None:
