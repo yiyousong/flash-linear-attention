@@ -9,5 +9,5 @@ def normalize_output(q, k, o, z_state):
     k = k.cumsum(-2)
     k = k + z_state
     z = (q * k).sum(-1, keepdim=True)
-    return o / (z + 1e-10)
+    return o / (z + 1e-10), k[...,-1:,:]
 
