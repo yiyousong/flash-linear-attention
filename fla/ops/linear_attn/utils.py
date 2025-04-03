@@ -4,10 +4,10 @@
 import torch
 
 
-@torch.compile
-def normalize_output(q, k, o, cum_k=None):
+@torch.jit.script
+def normalize_output(q, k, o, z_state):
     k = k.cumsum(-2)
-    if cum_k is not None:
-        k = k + cum_k
+    k = k + z_state
     z = (q * k).sum(-1, keepdim=True)
     return o / (z + 1e-10)
+
