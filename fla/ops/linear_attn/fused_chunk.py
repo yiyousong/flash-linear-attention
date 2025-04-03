@@ -276,10 +276,11 @@ def fused_chunk_linear_attn(
     v: torch.Tensor,
     scale: Optional[float] = None,
     initial_state: torch.Tensor = None,
-    cum_k: torch.Tensor = None,
+    z_state: torch.Tensor = None,
     output_final_state: bool = False,
     normalize: bool = True,
-    head_first: bool = True
+    head_first: bool = True,
+    output_z_state: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""
     Args:
@@ -294,12 +295,17 @@ def fused_chunk_linear_attn(
             If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
         initial_state (Optional[torch.Tensor]):
             Initial state of shape `[B, H, K, V]`. Default: `None`.
+        z_state (Optional[torch.Tensor]):
+            Z state Of shape `[B, H, K, 1]. This is only needed when normalization is enabled. `. Default: `None`.
         output_final_state (Optional[bool]):
             Whether to output the final state of shape `[B, H, K, V]`. Default: `False`.
         normalize (bool):
             Whether to normalize the output. Default: `True`.
         head_first (Optional[bool]):
             Whether the inputs are in the head-first format. Default: `True`.
+        output_z_state (Optional[bool]):
+            Whether to output the final Z state of shape `[B, H, K, 1]`. For API consistency, we recommend to update Z outside the function. Default: `False`.
+            
 
     Returns:
         o (torch.Tensor):
@@ -312,8 +318,17 @@ def fused_chunk_linear_attn(
     if not head_first:
         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
     o, final_state = FusedChunkLinearAttentionFunction.apply(q, k, v, scale, initial_state, output_final_state)
+    
     if normalize:
-        o = normalize_output(q * scale, k, o, cum_k)
+        if z_state is None:
+            k_shape = list(k.shape)
+            k_shape[-2 ]= 1
+            z_state = k.new_zeros(k_shape)
+        o = normalize_output(q * scale, k, o, z_state)
     if not head_first:
         o = o.transpose(1, 2)
+    
+    if normalize and output_z_state:
+        z_state = z_state + torch.sum(k, dim = -2, keepdim = True)
+        return o, final_state, z_state
     return o, final_state
