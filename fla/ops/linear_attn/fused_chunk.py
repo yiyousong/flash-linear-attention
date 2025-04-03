@@ -295,14 +295,13 @@ def fused_chunk_linear_attn(
         initial_state (Optional[torch.Tensor]):
             Initial state of shape `[B, H, K, V]`. Default: `None`.
         z_state (Optional[torch.Tensor]):
-            Z state Of shape `[B, H, K, 1]. This is only needed when normalization is enabled. `. Default: `None`.
+            Z state of shape `[B, H, K, 1]`. This is only needed when normalization is enabled. Default: `None`.
         output_final_state (Optional[bool]):
             Whether to output the final state of shape `[B, H, K, V]`. Default: `False`.
         normalize (bool):
             Whether to normalize the output. Default: `True`.
         head_first (Optional[bool]):
             Whether the inputs are in the head-first format. Default: `True`.
-            
 
     Returns:
         o (torch.Tensor):
