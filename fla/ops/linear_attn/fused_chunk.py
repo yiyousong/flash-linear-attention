@@ -280,7 +280,6 @@ def fused_chunk_linear_attn(
     output_final_state: bool = False,
     normalize: bool = True,
     head_first: bool = True,
-    output_z_state: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""
     Args:
@@ -303,8 +302,6 @@ def fused_chunk_linear_attn(
             Whether to normalize the output. Default: `True`.
         head_first (Optional[bool]):
             Whether the inputs are in the head-first format. Default: `True`.
-        output_z_state (Optional[bool]):
-            Whether to output the final Z state of shape `[B, H, K, 1]`. For API consistency, we recommend to update Z outside the function. Default: `False`.
             
 
     Returns:
@@ -324,11 +321,10 @@ def fused_chunk_linear_attn(
             k_shape = list(k.shape)
             k_shape[-2 ]= 1
             z_state = k.new_zeros(k_shape)
-        o = normalize_output(q * scale, k, o, z_state)
+        o, z_state = normalize_output(q * scale, k, o, z_state)
     if not head_first:
         o = o.transpose(1, 2)
     
-    if normalize and output_z_state:
-        z_state = z_state + torch.sum(k, dim = -2, keepdim = True)
+    if normalize:
         return o, (final_state, z_state)
     return o, final_state
