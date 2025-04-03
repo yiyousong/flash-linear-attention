@@ -330,5 +330,5 @@ def fused_chunk_linear_attn(
     
     if normalize and output_z_state:
         z_state = z_state + torch.sum(k, dim = -2, keepdim = True)
-        return o, final_state, z_state
+        return o, (final_state, z_state)
     return o, final_state
