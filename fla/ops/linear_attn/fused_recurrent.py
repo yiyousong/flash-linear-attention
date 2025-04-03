@@ -283,11 +283,10 @@ def fused_recurrent_linear_attn(
             k_shape = list(k.shape)
             k_shape[-2 ]= 1
             z_state = k.new_zeros(k_shape)
-        o = normalize_output(q * scale, k, o, z_state)
+        o, z_state = normalize_output(q * scale, k, o, z_state)
     if not head_first:
         o = o.transpose(1, 2)
     
     if normalize and output_z_state:
-        z_state = z_state + torch.sum(k, dim = -2, keepdim = True)
         return o, (final_state, z_state)
     return o, final_state
