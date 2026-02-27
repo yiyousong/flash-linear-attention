@@ -24,6 +24,8 @@ def test_chunk_kda_intracard_cache_hit_same_cu_seqlens_object(monkeypatch):
     1) intracard path is selected in inference mode, and
     2) early_return is bypassed and split path is exercised.
     """
+    # Enable intracard CP backend explicitly as it's disabled by default
+    monkeypatch.setenv("FLA_INTRACARD_CP", "1")
     torch.manual_seed(0)
     dtype = torch.bfloat16
 
@@ -88,3 +90,27 @@ def test_chunk_kda_intracard_cache_hit_same_cu_seqlens_object(monkeypatch):
     assert key[0] == id(cu_seqlens)
     assert entry.cu_seqlens_ref() is cu_seqlens
     assert torch.allclose(o1, o2, atol=1e-4, rtol=1e-4)
+
+
+def test_intracard_backend_disabled_by_default():
+    """Verify that IntraCardCPBackend is disabled by default."""
+    from fla.ops.common.backends.intracard import IntraCardCPBackend
+
+    # When env var is not set, backend should be disabled (default_enable=False)
+    assert IntraCardCPBackend.default_enable is False
+
+
+def test_intracard_backend_disabled_when_env_var_is_zero(monkeypatch):
+    """Verify that IntraCardCPBackend is disabled when FLA_INTRACARD_CP=0."""
+    from fla.ops.common.backends.intracard import IntraCardCPBackend
+
+    monkeypatch.setenv("FLA_INTRACARD_CP", "0")
+    assert IntraCardCPBackend.is_enabled() is False
+
+
+def test_intracard_backend_enabled_when_env_var_is_one(monkeypatch):
+    """Verify that IntraCardCPBackend is enabled when FLA_INTRACARD_CP=1."""
+    from fla.ops.common.backends.intracard import IntraCardCPBackend
+
+    monkeypatch.setenv("FLA_INTRACARD_CP", "1")
+    assert IntraCardCPBackend.is_enabled() is True
