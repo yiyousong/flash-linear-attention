@@ -1,3 +1,5 @@
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang
+
 from __future__ import annotations
 
 import math
@@ -56,7 +58,7 @@ class SambaBlock(GradientCheckpointingLayer):
                 state_size=config.state_size,
                 conv_kernel=config.conv_kernel,
                 intermediate_size=config.intermediate_size,
-                time_step_rank=config.time_step_rank,
+                dt_rank=config.time_step_rank,
                 use_bias=config.use_bias,
                 layer_idx=layer_idx,
             )
