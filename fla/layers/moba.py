@@ -16,11 +16,17 @@ from transformers.utils import logging
 
 from fla.layers.utils import pad_input, unpad_input
 from fla.modules import FusedRMSNormGated, RMSNorm, RotaryEmbedding
-from fla.ops.moba import moba_attn_varlen
+from fla.ops.moba import parallel_moba
 from fla.ops.utils.index import prepare_lens_from_mask
 
 if TYPE_CHECKING:
     from fla.models.utils import Cache
+
+try:
+    from flash_attn import flash_attn_func, flash_attn_varlen_func
+except ImportError:
+    flash_attn_func = None
+    flash_attn_varlen_func = None
 
 try:
     from flash_moba import flash_moba_varlen_func
@@ -30,7 +36,58 @@ except ImportError:
 logger = logging.get_logger(__name__)
 
 
-class MobaAttention(nn.Module):
+class MoBA(nn.Module):
+    """
+    The layer implementation for [MoBA: Mixture of Block Attention for Long-Context LLMs]
+    (https://arxiv.org/abs/2502.13189).
+
+    MoBA partitions the key/value sequence into fixed-size chunks ("blocks") and, for every query token,
+    only attends to a small set of the most relevant blocks instead of the entire history:
+
+    1. Each KV block is summarized by the mean of its keys, producing one representative key per block.
+    2. Each query token scores every block via a dot product with these representative keys, and selects
+       the `moba_topk` highest-scoring blocks (the block containing the query itself is always included
+       to preserve causal locality).
+    3. Self-attention is run inside the current block, block-MoBA attention is run over the selected
+       blocks, and the two outputs are merged via an online-softmax LSE combination.
+
+    This implementation exposes two backends:
+      - Triton / flash-attn path (`use_flash_moba=False`, default): routed through
+        `fla.ops.moba.parallel_moba`, which composes `flash_attn_varlen_func` with an online-softmax combine.
+      - FlashMoBA CUDA path (`use_flash_moba=True`): routed through
+        [`flash_moba_varlen_func`](https://github.com/mit-han-lab/flash-moba), a fused kernel from MIT HAN Lab
+        that performs gate computation, top-k selection, and attention in a single pass.
+
+    Args:
+        hidden_size (int, Optional):
+            The hidden size of the input. Default: 2048.
+        num_heads (int, Optional):
+            The number of query heads. Default: 32.
+        num_kv_heads (int, Optional):
+            The number of key/value heads for GQA. If None, falls back to MHA. Default: None.
+        qkv_bias (bool, Optional):
+            Whether to use bias in the Q/K/V projections. Default: `False`.
+        qk_norm (bool, Optional):
+            Whether to apply RMSNorm to Q and K before attention. Default: `False`.
+        window_size (int, Optional):
+            Sliding-window size forwarded to the KV cache. Default: None.
+        rope_theta (float, Optional):
+            The base frequency of RoPE. Default: 10000.
+        max_position_embeddings (int, Optional):
+            The maximum position used for RoPE scaling. Default: None.
+        layer_idx (int, Optional):
+            The index of the layer, required for KV cache bookkeeping. Default: None.
+        moba_chunk_size (int, Optional):
+            The size of each KV block. Tail blocks are handled via the chunk-masking
+            logic in `prepare_moba_chunks`. Default: 256.
+        moba_topk (int, Optional):
+            The number of blocks each query attends to, including the local block. Default: 4.
+        use_output_gate (bool, Optional):
+            Whether to apply a sigmoid-gated RMSNorm on the attention output. Default: `False`.
+        use_flash_moba (bool, Optional):
+            Whether to use the fused FlashMoBA CUDA kernel. Requires `pip install flash-moba`.
+            Default: `False`.
+    """
 
     def __init__(
         self,
@@ -45,7 +102,7 @@ class MobaAttention(nn.Module):
         layer_idx: int = None,
         moba_chunk_size: int = 256,
         moba_topk: int = 4,
-        use_output_gate: bool = True,
+        use_output_gate: bool = False,
         use_flash_moba: bool = False,
     ):
         super().__init__()
@@ -73,8 +130,8 @@ class MobaAttention(nn.Module):
 
         if self.use_flash_moba and flash_moba_varlen_func is None:
             raise ImportError(
-                "Please install `flash_moba` via `pip install flash-moba` "
-                "to use `use_flash_moba=True`."
+                "Please install FlashMoBA via `pip install flash-moba` first "
+                "(see https://github.com/mit-han-lab/flash-moba)."
             )
 
         self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=self.qkv_bias)
@@ -95,7 +152,6 @@ class MobaAttention(nn.Module):
             )
             self.o_norm = FusedRMSNormGated(self.head_dim, activation='sigmoid', eps=1e-6)
         else:
-            logger.info("MobaAttention is NOT using output gate.")
             self.o_norm = RMSNorm(self.head_dim, eps=1e-6)
 
     def forward(
@@ -147,10 +203,16 @@ class MobaAttention(nn.Module):
                 k = rearrange(k, '... (h d) -> ... h d', d=self.head_dim)
                 v = rearrange(v, '... (h d) -> ... h d', d=self.head_dim)
 
-        # Handle attention_mask by unpadding
+        # During decoding, fall back to dense full attention as prescribed by
+        # the MoBA paper (https://arxiv.org/abs/2502.13189, Sec. 3.3), which
+        # defines a seamless switch from block-sparse to full attention for the
+        # generation phase.
+        is_decoding = k.shape[1] != q_len
 
-        # Path 1: `attention_mask` is provided (e.g., Ruler tasks)
-        if attention_mask is not None:
+        # Path 1: padding mask provided AND caller did not pre-compute cu_seqlens.
+        # When both are present, `cu_seqlens` wins because it carries strictly
+        # more packing info than a 2D padding mask (see #842).
+        if attention_mask is not None and cu_seqlens is None:
             assert len(attention_mask.shape) == 2, (
                 "Expected attention_mask as a 0-1 matrix with shape [batch_size, seq_len] "
                 "for padding purposes (0 indicating padding). "
@@ -164,10 +226,19 @@ class MobaAttention(nn.Module):
             # q, k, v are (B, S, H, D). unpad_input turns them into (Total, H, D)
             q_unpad, (k_unpad, v_unpad), indices_q, cu_seqlens_tuple, max_seq_lens_tuple = unpad_input(
                 q, (k, v), attention_mask, q_len)
+            cu_seqlens_q, cu_seqlens_k = cu_seqlens_tuple
+            max_seqlen_q, max_seqlen_k = max_seq_lens_tuple
 
-            if self.use_flash_moba:
-                cu_seqlens_q, cu_seqlens_k = cu_seqlens_tuple
-                max_seqlen_q, max_seqlen_k = max_seq_lens_tuple
+            if is_decoding:
+                o_unpad = flash_attn_varlen_func(
+                    q_unpad, k_unpad, v_unpad,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    causal=True,
+                )
+            elif self.use_flash_moba:
                 o_unpad = flash_moba_varlen_func(
                     q=q_unpad,
                     k=k_unpad,
@@ -178,81 +249,63 @@ class MobaAttention(nn.Module):
                     max_seqlen_k=max_seqlen_k,
                     moba_chunk_size=self.moba_chunk_size,
                     moba_topk=self.moba_topk,
-                    causal=True
+                    causal=True,
                 )
             else:
-                if k.shape[1] != q_len:
-                    raise NotImplementedError(
-                        "MobaAttention cached decoding requires separate Q/KV varlen metadata for the Triton backend."
-                    )
-                cu_seqlens_moba = cu_seqlens_tuple[0]
-                max_seqlen_moba = max_seq_lens_tuple[0]
-                o_unpad = moba_attn_varlen(
-                    q_unpad,
-                    k_unpad,
-                    v_unpad,
-                    cu_seqlens=cu_seqlens_moba,
-                    max_seqlen=max_seqlen_moba,
-                    moba_chunk_size=self.moba_chunk_size,
-                    moba_topk=self.moba_topk
-                )
+                o_unpad = parallel_moba(
+                    q_unpad.unsqueeze(0),
+                    k_unpad.unsqueeze(0),
+                    v_unpad.unsqueeze(0),
+                    cu_seqlens=cu_seqlens_q,
+                    max_seqlen=max_seqlen_q,
+                    chunk_size=self.moba_chunk_size,
+                    topk=self.moba_topk,
+                ).squeeze(0)
 
             # pad_input turns o_unpad (Total, H, D) back into (B, S, H, D)
             o = pad_input(o_unpad, indices_q, batch_size, q_len)
 
-        # Path 2: No `attention_mask` (e.g., wikitext, or data is already unpadded)
+        # Path 2: no padding mask, or caller already provided cu_seqlens.
+        elif is_decoding:
+            # Dense causal attention over the cached KV (q_len typically 1).
+            o = flash_attn_func(q, k, v, causal=True)
         else:
-            k_len = k.shape[1]
-            q_unbatched = rearrange(q, 'b s h d -> (b s) h d')
-            k_unbatched = rearrange(k, 'b s h d -> (b s) h d')
-            v_unbatched = rearrange(v, 'b s h d -> (b s) h d')
+            # Pack the batch along the token axis ([1, B*T, H, D]) so that
+            # cu_seqlens can describe sample boundaries — the fla varlen
+            # convention requires batch size 1 with packed inputs.
+            q_packed = rearrange(q, 'b s h d -> 1 (b s) h d').contiguous()
+            k_packed = rearrange(k, 'b s h d -> 1 (b s) h d').contiguous()
+            v_packed = rearrange(v, 'b s h d -> 1 (b s) h d').contiguous()
+
+            offsets = torch.arange(batch_size + 1, dtype=torch.int32, device=hidden_states.device)
+            if isinstance(cu_seqlens, (tuple, list)):
+                cu_seqlens_q, _ = cu_seqlens
+            else:
+                cu_seqlens_q = offsets * q_len if cu_seqlens is None else cu_seqlens
 
             if self.use_flash_moba:
-                if cu_seqlens is None:
-                    cu_seqlens_q = torch.arange(0, (batch_size + 1) * q_len, step=q_len,
-                                                dtype=torch.int32, device=hidden_states.device)
-                    cu_seqlens_k = torch.arange(0, (batch_size + 1) * k_len, step=k_len,
-                                                dtype=torch.int32, device=hidden_states.device)
-                elif isinstance(cu_seqlens, (tuple, list)):
-                    cu_seqlens_q, cu_seqlens_k = cu_seqlens
-                else:
-                    cu_seqlens_q = cu_seqlens
-                    if k_len == q_len:
-                        cu_seqlens_k = cu_seqlens
-                    else:
-                        cu_seqlens_k = torch.arange(0, (batch_size + 1) * k_len, step=k_len,
-                                                    dtype=torch.int32, device=hidden_states.device)
-
                 o = flash_moba_varlen_func(
-                    q=q_unbatched,
-                    k=k_unbatched,
-                    v=v_unbatched,
+                    q=q_packed.squeeze(0),
+                    k=k_packed.squeeze(0),
+                    v=v_packed.squeeze(0),
                     cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k=cu_seqlens_k,
+                    cu_seqlens_k=cu_seqlens_q,
                     max_seqlen_q=q_len,
-                    max_seqlen_k=k_len,
+                    max_seqlen_k=q_len,
                     moba_chunk_size=self.moba_chunk_size,
                     moba_topk=self.moba_topk,
-                    causal=True
+                    causal=True,
                 )
             else:
-                if k_len != q_len:
-                    raise NotImplementedError(
-                        "MobaAttention cached decoding requires separate Q/KV varlen metadata for the Triton backend."
-                    )
-                if cu_seqlens is None:
-                    cu_seqlens = torch.arange(0, (batch_size + 1) * q_len, step=q_len,
-                                              dtype=torch.int32, device=hidden_states.device)
-
-                o = moba_attn_varlen(
-                    q_unbatched,
-                    k_unbatched,
-                    v_unbatched,
-                    cu_seqlens=cu_seqlens,
+                o = parallel_moba(
+                    q_packed,
+                    k_packed,
+                    v_packed,
+                    cu_seqlens=cu_seqlens_q,
                     max_seqlen=max_seqlen,
-                    moba_chunk_size=self.moba_chunk_size,
-                    moba_topk=self.moba_topk
-                )
+                    chunk_size=self.moba_chunk_size,
+                    topk=self.moba_topk,
+                ).squeeze(0)
 
             o = rearrange(o, '(b s) h d -> b s h d', b=batch_size)
 
