@@ -48,12 +48,6 @@ def chunk_linear_attn(
             `(kv_state, z_state)` tuple when `normalize=True`, or `None` when
             `output_final_state=False`.
     """
-    if q.shape[1] < q.shape[2]:
-        raise DeprecationWarning(
-            f"Input tensor shape suggests potential format mismatch: seq_len ({q.shape[1]}) < num_heads ({q.shape[2]}). "
-            "This may indicate the inputs were passed in head-first format [B, H, T, ...]. "
-            "Please verify your input tensor format matches the expected shape [B, T, H, ...].",
-        )
     if normalize and isinstance(initial_state, tuple):
         kv_init, z_init = initial_state
     else:
