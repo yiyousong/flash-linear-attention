@@ -7,7 +7,6 @@
 
 import torch
 
-from fla.ops.linear_attn.utils import normalize_output
 from fla.ops.simple_gla import fused_chunk_simple_gla
 
 
@@ -80,6 +79,7 @@ def fused_chunk_linear_attn(
         cu_seqlens=cu_seqlens,
     )
     if normalize:
-        o, z_state = normalize_output(q * scale, k, o, z_init)
-        return o, (final_state, z_state)
+        k_cum = k.cumsum(1) if z_init is None else k.cumsum(1) + z_init
+        o = o / ((q * scale * k_cum).sum(-1, keepdim=True) + 1e-10)
+        return o, (final_state, k_cum[:, -1:])
     return o, final_state
