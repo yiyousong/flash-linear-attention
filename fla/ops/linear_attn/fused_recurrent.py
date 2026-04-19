@@ -7,6 +7,7 @@
 
 import torch
 
+from fla.ops.linear_attn.utils import normalize_with_z_state
 from fla.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
 
 
@@ -82,7 +83,6 @@ def fused_recurrent_linear_attn(
         cu_seqlens=cu_seqlens,
     )
     if normalize:
-        k_cum = k.cumsum(1) if z_init is None else k.cumsum(1) + z_init
-        o = o / ((q * scale * k_cum).sum(-1, keepdim=True) + 1e-10)
-        return o, (final_state, k_cum[:, -1:])
+        o, z_state = normalize_with_z_state(o, q, k, scale, z_init, reverse, cu_seqlens)
+        return o, (final_state, z_state)
     return o, final_state
