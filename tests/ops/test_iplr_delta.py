@@ -1,7 +1,9 @@
-# -*- coding: utf-8 -*-
-
-import os
-from typing import Optional
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import pytest
 import torch
@@ -10,23 +12,7 @@ from einops import rearrange
 
 from fla.ops.generalized_delta_rule.iplr.chunk import chunk_iplr_delta_rule
 from fla.ops.generalized_delta_rule.iplr.fused_recurrent import fused_recurrent_iplr_delta_rule
-from fla.ops.utils.testing import assert_close
-from fla.utils import device
-
-compiled_mode = os.getenv("COMPILER_MODE") == "1"
-if compiled_mode:
-    test_b_list = [1]
-    test_t_list = [64]
-    test_t_varlen_list = test_t_list
-    test_d_list = [64, 128, 256]
-    test_gate_list = [1.0]
-else:
-    test_b_list = [2]
-    test_t_list = [1, 15, 63, 300]
-    test_t_varlen_list = [63, 286, 300, 512]
-    test_d_list = [32, 64, 100, 256]
-    test_gate_list = [1, 0.1, 10]
-test_h_list = [2]
+from fla.utils import assert_close, device
 
 
 def chunk_iplr_delta_rule_ref(
@@ -39,17 +25,12 @@ def chunk_iplr_delta_rule_ref(
     output_final_state: bool = True,
     scale: float = None,
     chunk_size: int = 64,
-    head_first: bool = True,
 ):
     BT = chunk_size
     if scale is None:
         scale = 1 / (q.shape[-1] ** 0.5)
-    if not head_first:
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        a = a.transpose(1, 2)
-        b = b.transpose(1, 2)
+
+    q, k, v, a, b = map(lambda x: x.transpose(1, 2), (q, k, v, a, b))
     T = q.shape[-2]
     pad_len = (BT - (T % BT)) % BT
     if pad_len > 0:
@@ -98,8 +79,7 @@ def chunk_iplr_delta_rule_ref(
     S = None if output_final_state is False else S
     o = rearrange(o, 'b h n c d -> b h (n c) d')
     o = o[:, :, :T]
-    if not head_first:
-        o = o.transpose(1, 2)
+    o = o.transpose(1, 2)
     return o, S
 
 
@@ -109,21 +89,14 @@ def recurrence_iplr_delta_rule_ref(
     v,
     a,
     b,
-    initial_state: Optional[torch.Tensor] = None,
+    initial_state: torch.Tensor | None = None,
     output_final_state: bool = True,
-    head_first: bool = True,
-    scale: Optional[float] = None
+    scale: float | None = None,
 ):
     orig_dtype = q.dtype
     if scale is None:
         scale = 1 / (q.shape[-1] ** 0.5)
-    if not head_first:
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        a = a.transpose(1, 2)
-        b = b.transpose(1, 2)
-    q, k, v, a, b = map(lambda x: x.to(torch.float32), [q, k, v, a, b])
+    q, k, v, a, b = map(lambda x: x.transpose(1, 2).to(torch.float32), [q, k, v, a, b])
     q = q * scale
     B, H, L, DK = q.shape
     DV = v.shape[-1]
@@ -142,98 +115,35 @@ def recurrence_iplr_delta_rule_ref(
         S = S + _kv
         o[:, :, i] = torch.einsum('bhd,bhdm->bhm', _q, S)
     S = None if output_final_state is False else S
-    if not head_first:
-        o = o.transpose(1, 2)
+    o = o.transpose(1, 2)
     return o.to(orig_dtype), S
 
 
-@pytest.mark.parametrize("B", test_b_list)
-@pytest.mark.parametrize("T", test_t_list)
-@pytest.mark.parametrize("H", test_h_list)
-@pytest.mark.parametrize("D", test_d_list)
-@pytest.mark.parametrize("scale", [0.25])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("head_first", [True, False])
-@pytest.mark.skipif(
-    os.getenv("SKIP_TEST_CHUNK_VARLEN") == "0",
-    reason="Skipping test because TEST_CHUNK_VARLEN is enabled"
+@pytest.mark.parametrize(
+    ('B', 'T', 'H', 'D', 'scale', 'dtype'),
+    [
+        pytest.param(*test, id="B{}-T{}-H{}-D{}-scale{}-{}".format(*test))
+        for test in [
+            (1, 63, 1, 64, 1, torch.float),
+            (2, 1024, 4, 60, 1, torch.float),
+            (2, 1024, 8, 100, 1, torch.float),
+            (2, 1024, 8, 128, 0.1, torch.float),
+            (4, 2048, 8, 64, 0.1, torch.float),
+        ]
+    ],
 )
-def test_chunk(
+def test_fused_recurrent(
     B: int,
     T: int,
     H: int,
     D: int,
     scale: float,
     dtype: torch.dtype,
-    head_first: bool,
 ):
-    if head_first:
-        q = torch.randn(B, H, T, D, dtype=dtype)
-        k = torch.randn(B, H, T, D, dtype=dtype)
-        v = torch.randn(B, H, T, D, dtype=dtype)
-        a = torch.rand(B, H, T, D, dtype=dtype)
-    else:
-        q = torch.randn(B, T, H, D, dtype=dtype)
-        k = torch.randn(B, T, H, D, dtype=dtype)
-        v = torch.randn(B, T, H, D, dtype=dtype)
-        a = torch.rand(B, T, H, D, dtype=dtype)
-
-    a = F.normalize(a, p=2, dim=-1)
-    b = -a
-    h0 = torch.zeros(B, H, D, D, dtype=torch.float32)
-    q, k, v, a, b, h0 = map(lambda x: x.to(device).requires_grad_(), (q, k, v, a, b, h0))
-    ref, ref_ht = recurrence_iplr_delta_rule_ref(
-        q=q.clone(),
-        k=k.clone(),
-        v=v.clone(),
-        a=a.clone(),
-        b=b.clone(),
-        scale=scale,
-        initial_state=h0.clone(),
-        output_final_state=True,
-        head_first=head_first
-    )
-    tri, tri_ht = chunk_iplr_delta_rule(
-        q=q.clone(),
-        k=k.clone(),
-        v=v.clone(),
-        a=a.clone(),
-        b=b.clone(),
-        scale=scale,
-        initial_state=h0.clone(),
-        output_final_state=True,
-        head_first=head_first
-    )
-    assert_close("  o", ref, tri, 0.007)
-    assert_close(" ht", ref_ht, tri_ht, 0.008)
-
-
-@pytest.mark.parametrize("B", test_b_list)
-@pytest.mark.parametrize("T", test_t_list)
-@pytest.mark.parametrize("H", test_h_list)
-@pytest.mark.parametrize("D", test_d_list)
-@pytest.mark.parametrize("scale", [0.25])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("head_first", [True, False])
-def test_recurrent(
-    B: int,
-    T: int,
-    H: int,
-    D: int,
-    scale: float,
-    dtype: torch.dtype,
-    head_first: bool,
-):
-    if head_first:
-        q = torch.randn(B, H, T, D, dtype=dtype)
-        k = torch.randn(B, H, T, D, dtype=dtype)
-        v = torch.randn(B, H, T, D, dtype=dtype)
-        a = torch.rand(B, H, T, D, dtype=dtype)
-    else:
-        q = torch.randn(B, T, H, D, dtype=dtype)
-        k = torch.randn(B, T, H, D, dtype=dtype)
-        v = torch.randn(B, T, H, D, dtype=dtype)
-        a = torch.rand(B, T, H, D, dtype=dtype)
+    q = torch.randn(B, T, H, D, dtype=dtype)
+    k = torch.randn(B, T, H, D, dtype=dtype)
+    v = torch.randn(B, T, H, D, dtype=dtype)
+    a = torch.rand(B, T, H, D, dtype=dtype)
 
     a = F.normalize(a, p=2, dim=-1)
     b = -a
@@ -248,7 +158,6 @@ def test_recurrent(
         scale=scale,
         initial_state=h0.clone(),
         output_final_state=True,
-        head_first=head_first
     )
     dht = torch.rand_like(h0)
     do = torch.rand_like(ref)
@@ -264,14 +173,68 @@ def test_recurrent(
         scale=scale,
         initial_state=h0.clone(),
         output_final_state=True,
-        head_first=head_first
     )
     ((dht * tri_ht).sum() + (do * tri).sum()).backward()
-    assert_close("  o", ref, tri, 0.003)
-    assert_close(" ht", ref_ht, tri_ht, 0.003)
-    assert_close(" dq", dq, q.grad, 0.003)
-    assert_close(" dk", dk, k.grad, 0.003)
-    assert_close(" dv", dv, v.grad, 0.003)
-    assert_close(" da", da, a.grad, 0.003)
-    assert_close(" db", db, b.grad, 0.003)
-    assert_close(" dh0", dh0, h0.grad, 0.003)
+    assert_close('o', ref, tri, 0.003)
+    assert_close('ht', ref_ht, tri_ht, 0.003)
+    assert_close('dq', dq, q.grad, 0.003)
+    assert_close('dk', dk, k.grad, 0.003)
+    assert_close('dv', dv, v.grad, 0.003)
+    assert_close('da', da, a.grad, 0.003)
+    assert_close('db', db, b.grad, 0.003)
+    assert_close('dh0', dh0, h0.grad, 0.003)
+
+
+@pytest.mark.parametrize(
+    ('B', 'T', 'H', 'D', 'scale', 'dtype'),
+    [
+        pytest.param(*test, id="B{}-T{}-H{}-D{}-scale{}-{}".format(*test))
+        for test in [
+            (1, 63, 1, 64, 1, torch.float16),
+            (2, 500, 3, 60, 1, torch.float16),
+            (2, 1000, 3, 64, 0.1, torch.float16),
+            (2, 1024, 4, 100, 1, torch.float16),
+            (3, 1024, 4, 128, 0.1, torch.float16),
+            (4, 2048, 8, 64, 0.1, torch.float16),
+        ]
+    ],
+)
+def test_chunk(
+    B: int,
+    T: int,
+    H: int,
+    D: int,
+    scale: float,
+    dtype: torch.dtype,
+):
+    q = torch.randn(B, T, H, D, dtype=dtype)
+    k = torch.randn(B, T, H, D, dtype=dtype)
+    v = torch.randn(B, T, H, D, dtype=dtype)
+    a = torch.rand(B, T, H, D, dtype=dtype)
+
+    a = F.normalize(a, p=2, dim=-1)
+    b = -a
+    h0 = torch.zeros(B, H, D, D, dtype=torch.float32)
+    q, k, v, a, b, h0 = map(lambda x: x.to(device).requires_grad_(), (q, k, v, a, b, h0))
+    ref, ref_ht = recurrence_iplr_delta_rule_ref(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        a=a.clone(),
+        b=b.clone(),
+        scale=scale,
+        initial_state=h0.clone(),
+        output_final_state=True,
+    )
+    tri, tri_ht = chunk_iplr_delta_rule(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        a=a.clone(),
+        b=b.clone(),
+        scale=scale,
+        initial_state=h0.clone(),
+        output_final_state=True,
+    )
+    assert_close('o', ref, tri, 0.007)
+    assert_close('ht', ref_ht, tri_ht, 0.008)

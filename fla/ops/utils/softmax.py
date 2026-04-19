@@ -1,32 +1,34 @@
-# -*- coding: utf-8 -*-
-# Copyright (c) 2023-2024, Songlin Yang, Yu Zhang
-
-from typing import Optional
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import torch
 import triton
 import triton.language as tl
 
 from fla.ops.utils.op import exp
+from fla.utils import IS_AMD, autotune_cache_kwargs
+
+NUM_WARPS_AUTOTUNE = [1, 2, 4, 8, 16] if IS_AMD else [1, 2, 4, 8, 16, 32]
 
 
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=1),
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-        triton.Config({}, num_warps=16),
-        triton.Config({}, num_warps=32)
+        triton.Config({}, num_warps=num_warps)
+        for num_warps in NUM_WARPS_AUTOTUNE
     ],
-    key=['D']
+    key=['D'],
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def softmax_fwd_kernel(
     x,
     p,
     D: tl.constexpr,
-    B: tl.constexpr
+    B: tl.constexpr,
 ):
     i_n = tl.program_id(0)
     o_d = tl.arange(0, B)
@@ -42,14 +44,11 @@ def softmax_fwd_kernel(
 
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=1),
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-        triton.Config({}, num_warps=16),
-        triton.Config({}, num_warps=32)
+        triton.Config({}, num_warps=num_warps)
+        for num_warps in NUM_WARPS_AUTOTUNE
     ],
-    key=['D']
+    key=['D'],
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def softmax_bwd_kernel(
@@ -57,7 +56,7 @@ def softmax_bwd_kernel(
     dp,
     ds,
     D: tl.constexpr,
-    B: tl.constexpr
+    B: tl.constexpr,
 ):
     i_n = tl.program_id(0)
     o_d = tl.arange(0, B)
@@ -72,7 +71,7 @@ def softmax_bwd_kernel(
 
 def softmax_fwd(
     x: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.float
+    dtype: torch.dtype | None = torch.float,
 ) -> torch.Tensor:
     shape = x.shape
     x = x.view(-1, x.shape[-1])
@@ -85,7 +84,7 @@ def softmax_fwd(
         x=x,
         p=p,
         D=D,
-        B=B
+        B=B,
     )
     return p.view(*shape)
 
@@ -93,7 +92,7 @@ def softmax_fwd(
 def softmax_bwd(
     p: torch.Tensor,
     dp: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.float
+    dtype: torch.dtype | None = torch.float,
 ) -> torch.Tensor:
     shape = p.shape
     p = p.view(-1, p.shape[-1])
@@ -106,6 +105,6 @@ def softmax_bwd(
         dp=dp,
         ds=ds,
         D=D,
-        B=B
+        B=B,
     )
     return ds.view(*shape)

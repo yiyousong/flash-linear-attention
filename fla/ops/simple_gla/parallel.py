@@ -1,25 +1,39 @@
-# -*- coding: utf-8 -*-
-# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
-from typing import Optional, Tuple
+import warnings
 
 import torch
 import triton
 import triton.language as tl
 
-from fla.ops.utils import chunk_global_cumsum, chunk_local_cumsum
-from fla.ops.utils.op import safe_exp
-from fla.utils import autocast_custom_bwd, autocast_custom_fwd, check_shared_mem, input_guard, is_intel_alchemist
+from fla.ops.utils import prepare_chunk_indices
+from fla.ops.utils.cumsum import chunk_global_cumsum, chunk_local_cumsum
+from fla.ops.utils.op import exp
+from fla.utils import (
+    IS_INTEL_ALCHEMIST,
+    IS_NVIDIA_HOPPER,
+    autocast_custom_bwd,
+    autocast_custom_fwd,
+    autotune_cache_kwargs,
+    check_shared_mem,
+    input_guard,
+)
 
 # https://github.com/intel/intel-xpu-backend-for-triton/issues/3449
-triton_config = {'grf_mode': 'large'} if is_intel_alchemist else {}
+triton_config = {'grf_mode': 'large'} if IS_INTEL_ALCHEMIST else {}
+NUM_WARPS = [2, 4, 8] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
 
 
 @triton.heuristics({
     'NV': lambda args: triton.cdiv(args['V'], args['BV']),
     'OUTPUT_ATTENTIONS': lambda args: args['attn'] is not None,
-    'USE_OFFSETS': lambda args: args['offsets'] is not None,
-    'USE_G': lambda args: args['g'] is not None
+    'USE_G': lambda args: args['g'] is not None,
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
     configs=[
@@ -28,6 +42,7 @@ triton_config = {'grf_mode': 'large'} if is_intel_alchemist else {}
         for num_stages in [2, 3, 4]
     ],
     key=["BT", "BS", "BK", "BV", "USE_G"],
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def parallel_simple_gla_fwd_kernel(
@@ -38,8 +53,8 @@ def parallel_simple_gla_fwd_kernel(
     o,
     attn,
     scale,
-    offsets,
-    indices,
+    cu_seqlens,
+    chunk_indices,
     T,
     B: tl.constexpr,
     H: tl.constexpr,
@@ -51,36 +66,31 @@ def parallel_simple_gla_fwd_kernel(
     BV: tl.constexpr,
     NV: tl.constexpr,
     OUTPUT_ATTENTIONS: tl.constexpr,
-    HEAD_FIRST: tl.constexpr,
-    USE_OFFSETS: tl.constexpr,
-    USE_G: tl.constexpr
+    IS_VARLEN: tl.constexpr,
+    USE_G: tl.constexpr,
 ):
-    tl.static_assert(not (USE_OFFSETS and HEAD_FIRST), "USE_OFFSETS and HEAD_FIRST cannot be True at the same time")
     i_kv, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_k, i_v = i_kv // NV, i_kv % NV
     i_b, i_h = i_bh // H, i_bh % H
-    o += i_k * B * T * H * V
 
-    if USE_OFFSETS:
-        i_n, i_t = tl.load(indices + i_t * 2).to(tl.int32), tl.load(indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(offsets + i_n).to(tl.int32), tl.load(offsets + i_n + 1).to(tl.int32)
+    all = B * T
+    if IS_VARLEN:
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
 
-    q += i_bh * T * K if HEAD_FIRST else (bos * H + i_h) * K
-    k += i_bh * T * K if HEAD_FIRST else (bos * H + i_h) * K
-    v += i_bh * T * V if HEAD_FIRST else (bos * H + i_h) * V
-    o += i_bh * T * V if HEAD_FIRST else (bos * H + i_h) * V
+    q += (bos * H + i_h) * K
+    k += (bos * H + i_h) * K
+    v += (bos * H + i_h) * V
+    o += ((i_k * all + bos) * H + i_h) * V
     if USE_G:
-        g += i_bh * T if HEAD_FIRST else bos * H + i_h
+        g += bos * H + i_h
     if OUTPUT_ATTENTIONS:
-        attn += (bos * H + i_h * T) * T + i_k * B * H * T * T
-    stride_qk = K if HEAD_FIRST else H * K
-    stride_vo = V if HEAD_FIRST else H * V
-    stride_g = 1 if HEAD_FIRST else H
+        attn += i_k * B * H * T * T + (bos * H + i_h * T) * T
 
-    p_q = tl.make_block_ptr(q, (T, K), (stride_qk, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+    p_q = tl.make_block_ptr(q, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
 
     # the Q block is kept in the shared memory throughout the whole kernel
     # [BT, BK]
@@ -90,65 +100,66 @@ def parallel_simple_gla_fwd_kernel(
 
     # [BT]
     o_q = i_t * BT + tl.arange(0, BT)
-    # [BS]
-    o_k = i_t * BT + tl.arange(0, BS)
+    m_q = o_q < T
     # Q block and K block have overlap.
     # masks required
     if USE_G:
-        p_gq = tl.make_block_ptr(g, (T,), (stride_g,), (i_t * BT,), (BT,), (0,))
         # [BT,]
-        b_gq = tl.load(p_gq, boundary_check=(0,)).to(tl.float32)
+        b_gq = tl.load(g + o_q * H, mask=m_q, other=float('-inf')).to(tl.float32)
         # rescale interchunk output
     else:
         b_gq = None
 
     for i_s in range(i_t * BT, min((i_t + 1) * BT, T), BS):
-        p_k = tl.make_block_ptr(k, (K, T), (1, stride_qk), (i_k * BK, i_s), (BK, BS), (0, 1))
-        p_v = tl.make_block_ptr(v, (T, V), (stride_vo, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
+        p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (i_k * BK, i_s), (BK, BS), (0, 1))
+        p_v = tl.make_block_ptr(v, (T, V), (H*V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
+
+        o_k = i_s + tl.arange(0, BS)
+        m_k = o_k < T
         # [BK, BS]
         b_k = tl.load(p_k, boundary_check=(0, 1))
         # [BS, BV]
         b_v = tl.load(p_v, boundary_check=(0, 1))
         # [BT, BS]
-        m_s = o_q[:, None] >= o_k[None, :]
+        m_s = (o_q[:, None] >= o_k[None, :]) & (m_q[:, None] & m_k[None, :])
         b_s = tl.dot(b_q, b_k)
         if USE_G:
-            p_gk = tl.make_block_ptr(g, (T,), (stride_g,), (i_s,), (BS,), (0,))
-            b_gk = tl.load(p_gk, boundary_check=(0,))
-            b_s *= safe_exp(b_gq[:, None] - b_gk[None, :])
-            b_s = tl.where(m_s, b_s, 0)
-        else:
-            b_s = tl.where(m_s, b_s, 0)
+            b_gk = tl.load(g + o_k * H, mask=m_k, other=0)
+            b_s *= exp(b_gq[:, None] - b_gk[None, :])
+        b_s = tl.where(m_s, b_s, 0)
         # [BT, BV]
         if i_s >= 0:
             b_o += tl.dot(b_s.to(b_q.dtype), b_v)
         if OUTPUT_ATTENTIONS:
             p_a = tl.make_block_ptr(attn, (T, T), (T, 1), (i_t * BT, i_s), (BT, BS), (1, 0))
             tl.store(p_a, b_s.to(p_a.dtype.element_ty), boundary_check=(0, 1))
-        o_k += BS
-
     for i_s in range(i_t * BT - BS, -BS, -BS):
-        p_k = tl.make_block_ptr(k, (K, T), (1, stride_qk), (i_k * BK, i_s), (BK, BS), (0, 1))
-        p_v = tl.make_block_ptr(v, (T, V), (stride_vo, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
+        p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (i_k * BK, i_s), (BK, BS), (0, 1))
+        p_v = tl.make_block_ptr(v, (T, V), (H*V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
+
+        o_k = i_s + tl.arange(0, BS)
+        m_k = o_k < T
         # [BK, BS]
         b_k = tl.load(p_k, boundary_check=(0, 1))
         # [BS, BV]
         b_v = tl.load(p_v, boundary_check=(0, 1))
+        # [BT, BS]
+        m_s = m_q[:, None] & m_k[None, :]
         b_s = tl.dot(b_q, b_k)
         if USE_G:
-            p_g = tl.make_block_ptr(g, (T,), (stride_g,), (i_s,), (BS,), (0,))
-            b_g = tl.load(p_g, boundary_check=(0,))
-            b_gn = tl.load(g + (min(i_s + BS, T) - 1) * stride_g)
-            b_gp = tl.load(g + (i_s-1) * stride_g) if i_s % BT > 0 else 0.
+            b_g = tl.load(g + o_k * H, mask=m_k, other=0)
+            b_gn = tl.load(g + (min(i_s + BS, T) - 1) * H)
+            b_gp = tl.load(g + (i_s-1) * H) if i_s % BT > 0 else 0.
             # No concrete meaning. Just to avoid some layout bugs.
-            b_s *= safe_exp(b_gq[:, None] + (b_gn - b_g)[None, :])
-            b_gq += (b_gn - b_gp)
+            b_s *= exp(b_gq[:, None] + (b_gn - b_g)[None, :])
+            b_gq += b_gn - b_gp
+        b_s = tl.where(m_s, b_s, 0)
         if OUTPUT_ATTENTIONS:
             p_a = tl.make_block_ptr(attn, (T, T), (T, 1), (i_t * BT, i_s), (BT, BS), (1, 0))
             tl.store(p_a, b_s.to(p_a.dtype.element_ty), boundary_check=(0, 1))
         if i_s >= 0:
             b_o += tl.dot(b_s.to(b_v.dtype), b_v)
-    p_o = tl.make_block_ptr(o, (T, V), (stride_vo, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+    p_o = tl.make_block_ptr(o, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -164,28 +175,32 @@ def parallel_simple_gla_bwd_kernel_dq(
     do,
     dq,
     dg,
-    stride_qk,
-    stride_vo,
-    stride_g,
     scale,
     T,
+    H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
     BS: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
-    USE_G: tl.constexpr
+    USE_G: tl.constexpr,
 ):
-    p_do = tl.make_block_ptr(do, (T, V), (stride_vo, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+    p_do = tl.make_block_ptr(do, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
     # [BT, BV]
     b_do = tl.load(p_do, boundary_check=(0, 1))
     # [BT, BK]
     b_dq = tl.zeros([BT, BK], dtype=tl.float32)
 
+    # [BT]
+    o_q = i_t * BT + tl.arange(0, BT)
+    m_q = o_q < T
     for i_s in range(0, i_t * BT, BS):
-        p_k = tl.make_block_ptr(k, (T, K), (stride_qk, 1), (i_s, i_k * BK), (BS, BK), (1, 0))
-        p_v = tl.make_block_ptr(v, (V, T), (1, stride_vo), (i_v * BV, i_s), (BV, BS), (0, 1))
+        p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_s, i_k * BK), (BS, BK), (1, 0))
+        p_v = tl.make_block_ptr(v, (V, T), (1, H*V), (i_v * BV, i_s), (BV, BS), (0, 1))
+
+        o_k = i_s + tl.arange(0, BS)
+        m_k = o_k < T
         # [BS, BK]
         b_k = tl.load(p_k, boundary_check=(0, 1))
         # [BV, BS]
@@ -193,31 +208,28 @@ def parallel_simple_gla_bwd_kernel_dq(
         # [BT, BV] @ [BV, BS] = [BT, BS]
         b_ds = tl.dot(b_do, b_v)
         if USE_G:
-            p_g = tl.make_block_ptr(g, (T,), (stride_g,), (i_s,), (BS,), (0,))
-            b_g = tl.load(p_g, boundary_check=(0,))
-            b_gn = tl.load(g + (min(i_s + BS, T) - 1) * stride_g)
-            b_gp = tl.load(g + (i_s - 1) * stride_g) if i_s % BT > 0 else 0.
-            b_ds *= safe_exp(b_gn - b_g)[None, :]
+            b_g = tl.load(g + o_k * H, mask=m_k, other=0)
+            b_gn = tl.load(g + (min(i_s + BS, T) - 1) * H)
+            b_gp = tl.load(g + (i_s - 1) * H) if i_s % BT > 0 else 0.
+            b_ds *= tl.where(m_k, exp(b_gn - b_g), 0)[None, :]
             if i_s > 0:
-                b_dq *= safe_exp(b_gn - b_gp)
+                b_dq *= exp(b_gn - b_gp)
         # [BT, BS] @ [BS, BK] = [BT, BK]
         b_dq += tl.dot(b_ds.to(b_v.dtype), b_k)
 
     if USE_G:
-        p_gq = tl.make_block_ptr(g, (T,), (stride_g,), (i_t * BT,), (BT,), (0,))
         # [BT,]
-        b_gq = tl.load(p_gq, boundary_check=(0,))
+        b_gq = tl.load(g + o_q * H, mask=m_q, other=float('-inf'))
         # [BT, BK]
-        b_dq *= safe_exp(b_gq)[:, None]
+        b_dq *= exp(b_gq)[:, None]
 
-    # [BT]
-    o_q = i_t * BT + tl.arange(0, BT)
-    # [BS]
-    o_k = i_t * BT + tl.arange(0, BS)
     # Q block and K block have overlap. masks required
     for i_s in range(i_t * BT, min((i_t + 1) * BT, T), BS):
-        p_k = tl.make_block_ptr(k, (T, K), (stride_qk, 1), (i_s, i_k * BK), (BS, BK), (1, 0))
-        p_v = tl.make_block_ptr(v, (V, T), (1, stride_vo), (i_v * BV, i_s), (BV, BS), (0, 1))
+        p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_s, i_k * BK), (BS, BK), (1, 0))
+        p_v = tl.make_block_ptr(v, (V, T), (1, H*V), (i_v * BV, i_s), (BV, BS), (0, 1))
+
+        o_k = i_s + tl.arange(0, BS)
+        m_k = o_k < T
         # [BS, BK]
         b_k = tl.load(p_k, boundary_check=(0, 1))
         # [BV, BS]
@@ -225,22 +237,21 @@ def parallel_simple_gla_bwd_kernel_dq(
         # [BT, BV] @ [BV, BS] = [BT, BS]
         b_ds = tl.dot(b_do, b_v)
         if USE_G:
-            p_gk = tl.make_block_ptr(g, (T,), (stride_g,), (i_s,), (BS,), (0,))
-            b_gk = tl.load(p_gk, boundary_check=(0,))
-            b_ds *= safe_exp(b_gq[:, None] - b_gk[None, :])
-        b_ds = tl.where(o_q[:, None] >= o_k[None, :], b_ds, 0)
+            b_gk = tl.load(g + o_k * H, mask=m_k, other=0)
+            b_ds *= exp(b_gq[:, None] - b_gk[None, :])
+        m_s = (o_q[:, None] >= o_k[None, :]) & (m_q[:, None] & m_k[None, :])
+        b_ds = tl.where(m_s, b_ds, 0)
         # [BT, BK]
         b_dq += tl.dot(b_ds.to(b_k.dtype), b_k)
-        o_k += BS
 
     b_dq *= scale
-    p_dq = tl.make_block_ptr(dq, (T, K), (stride_qk, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+    p_dq = tl.make_block_ptr(dq, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
     tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), boundary_check=(0, 1))
     if USE_G:
-        p_q = tl.make_block_ptr(q, (T, K), (stride_qk, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_q = tl.make_block_ptr(q, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         b_q = tl.load(p_q, boundary_check=(0, 1))
         b_dg = tl.sum(b_dq * b_q, 1)
-        p_dg = tl.make_block_ptr(dg, (T,), (stride_g,), (i_t * BT,), (BT,), (0,))
+        p_dg = tl.make_block_ptr(dg, (T,), (H,), (i_t * BT,), (BT,), (0,))
         tl.store(p_dg, b_dg.to(p_dg.dtype.element_ty), boundary_check=(0,))
 
 
@@ -258,112 +269,115 @@ def parallel_simple_gla_bwd_kernel_dkv(
     dv,
     dg,
     scale,
-    stride_qk,
-    stride_vo,
-    stride_g,
     T,
+    H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
     BS: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
-    USE_G: tl.constexpr
+    USE_G: tl.constexpr,
 ):
+    o_k = i_t * BT + tl.arange(0, BT)
+    m_k = o_k < T
     # [BT, BK]
-    p_k = tl.make_block_ptr(k, (T, K), (stride_qk, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+    p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
     b_k = tl.load(p_k, boundary_check=(0, 1))
     b_dk = tl.zeros([BT, BK], dtype=tl.float32)
     # [BT, BV]
-    p_v = tl.make_block_ptr(v, (T, V), (stride_vo, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+    p_v = tl.make_block_ptr(v, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
     b_v = tl.load(p_v, boundary_check=(0, 1))
     b_dv = tl.zeros([BT, BV], dtype=tl.float32)
     if USE_G:
-        p_gk = tl.make_block_ptr(g, (T,), (stride_g,), (i_t * BT,), (BT,), (0,))
-        b_gk = tl.load(p_gk, boundary_check=(0,))
+        b_gk = tl.load(g + o_k * H, mask=m_k, other=0)
     NTS = tl.cdiv(T, BS)
     # [BT, BK]
     for i_s in range(NTS * BS - BS, (i_t + 1) * BT - BS, -BS):
-        p_q = tl.make_block_ptr(q, (T, K), (stride_qk, 1), (i_s, i_k * BK), (BS, BK), (1, 0))
-        p_do = tl.make_block_ptr(do, (T, V), (stride_vo, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
+        p_q = tl.make_block_ptr(q, (T, K), (H*K, 1), (i_s, i_k * BK), (BS, BK), (1, 0))
+        p_do = tl.make_block_ptr(do, (T, V), (H*V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
+
+        o_q = i_s + tl.arange(0, BS)
+        m_q = o_q < T
+        # [BS, BK]
         b_q = tl.load(p_q, boundary_check=(0, 1))
+        # [BS, BV]
         b_do = tl.load(p_do, boundary_check=(0, 1))
+        # [BT, BS]
         b_ds = tl.dot(b_v, tl.trans(b_do))
         b_s = tl.dot(b_k, tl.trans(b_q))
         if USE_G:
-            p_gq = tl.make_block_ptr(g, (T,), (stride_g,), (i_s,), (BS,), (0,))
-            b_gq = tl.load(p_gq, boundary_check=(0,))
-            b_gp = tl.load(g + (min(i_s + BS, T) - 1) * stride_g)
-            b_gn = tl.load(g + (i_s - 1) * stride_g) if i_s % BT > 0 else 0.
+            b_gq = tl.load(g + o_q * H, mask=m_q, other=float('-inf'))
+            b_gp = tl.load(g + (min(i_s + BS, T) - 1) * H)
+            b_gn = tl.load(g + (i_s - 1) * H) if i_s % BT > 0 else 0.
             if i_s >= 0:
-                tmp = safe_exp(b_gp - b_gn)
-                b_dk *= tmp
-                b_dv *= tmp
-                tmp2 = safe_exp(b_gq - b_gn)
-                b_ds *= tmp2[None, :]
-                b_s *= tmp2[None, :]
+                b_gpn = exp(b_gp - b_gn)
+                b_dk *= b_gpn
+                b_dv *= b_gpn
+                b_gqn = exp(b_gq - b_gn)
+                b_ds *= b_gqn[None, :]
+                b_s *= b_gqn[None, :]
         # [BT, BK]
         b_dk += tl.dot(b_ds.to(b_q.dtype), b_q)
         # [BT, BV]
         b_dv += tl.dot(b_s.to(b_do.dtype), b_do)
 
     if USE_G:
-        b_g_last = tl.load(g + (min(i_t * BT + BT, T) - 1) * stride_g)
+        b_gn = tl.load(g + (min(i_t * BT + BT, T) - 1) * H)
         if i_t >= 0:
-            tmp2 = safe_exp(b_g_last - b_gk)[:, None]
-            b_dk *= tmp2
-            b_dv *= tmp2
+            b_gpn = exp(b_gn - b_gk)[:, None]
+            b_dk *= b_gpn
+            b_dv *= b_gpn
 
-    o_q = i_t * BT + tl.arange(0, BS)
-    o_k = i_t * BT + tl.arange(0, BT)
     for i_s in range(i_t * BT, min((i_t + 1) * BT, T), BS):
-        p_q = tl.make_block_ptr(q, (T, K), (stride_qk, 1), (i_s, i_k * BK), (BS, BK), (1, 0))
-        p_do = tl.make_block_ptr(do, (T, V), (stride_vo, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
+        p_q = tl.make_block_ptr(q, (T, K), (H*K, 1), (i_s, i_k * BK), (BS, BK), (1, 0))
+        p_do = tl.make_block_ptr(do, (T, V), (H*V, 1), (i_s, i_v * BV), (BS, BV), (1, 0))
+
+        o_q = i_s + tl.arange(0, BS)
+        m_q = o_q < T
         # [BS, BK]
         b_q = tl.load(p_q, boundary_check=(0, 1))
         # [BS, BV]
         b_do = tl.load(p_do, boundary_check=(0, 1))
         # [BS]
-        b_ds = tl.dot(b_v, tl.trans(b_do))
         b_s = tl.dot(b_k, tl.trans(b_q))
+        b_ds = tl.dot(b_v, tl.trans(b_do))
         if USE_G:
-            p_gq = tl.make_block_ptr(g, (T,), (stride_g,), (i_s,), (BS,), (0,))
-            b_gq = tl.load(p_gq, boundary_check=(0,))
+            b_gq = tl.load(g + o_q * H, mask=m_q, other=float('-inf'))
             if i_s >= 0:
-                tmp = safe_exp(-b_gk[:, None] + b_gq[None, :])
-                b_ds *= tmp
-                b_s *= tmp
+                b_gkq = exp(-b_gk[:, None] + b_gq[None, :])
+                b_ds *= b_gkq
+                b_s *= b_gkq
         m_s = o_k[:, None] <= o_q[None, :]
         b_s = tl.where(m_s, b_s, 0)
         b_ds = tl.where(m_s, b_ds, 0)
         # [BT, BK]
         b_dk += tl.dot(b_ds.to(b_q.dtype), b_q)
         b_dv += tl.dot(b_s.to(b_do.dtype), b_do)
-        o_q += BS
     b_dk *= scale
     b_dv *= scale
-    p_dk = tl.make_block_ptr(dk, (T, K), (stride_qk, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-    p_dv = tl.make_block_ptr(dv, (T, V), (stride_vo, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+    p_dk = tl.make_block_ptr(dk, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+    p_dv = tl.make_block_ptr(dv, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
     tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
     tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
     if USE_G:
-        p_dg = tl.make_block_ptr(dg, (T,), (stride_g,), (i_t * BT,), (BT,), (0,))
-        b_dg = tl.load(p_dg, boundary_check=(0,))
+        b_dg = tl.load(dg + o_k * H, mask=m_k, other=0)
         b_dg -= tl.sum(b_dk * b_k, 1)
-        tl.store(p_dg, b_dg.to(p_dg.dtype.element_ty), boundary_check=(0,))
+        tl.store(dg + o_k * H, b_dg.to(dg.dtype.element_ty), mask=m_k)
 
 
 @triton.heuristics({
     'NV': lambda args: triton.cdiv(args['V'], args['BV']),
-    'USE_OFFSETS': lambda args: args['offsets'] is not None,
-    'USE_G': lambda args: args['g'] is not None
+    'USE_G': lambda args: args['g'] is not None,
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
     configs=[
         triton.Config(triton_config, num_warps=num_warps)
-        for num_warps in [2, 4, 8, 16]
+        for num_warps in NUM_WARPS
     ],
     key=['BT', 'BS', 'BK', 'BV', 'USE_G'],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def parallel_simple_gla_bwd_kernel(
@@ -377,8 +391,8 @@ def parallel_simple_gla_bwd_kernel(
     dv,
     dg,
     scale,
-    offsets,
-    indices,
+    cu_seqlens,
+    chunk_indices,
     T,
     B: tl.constexpr,
     H: tl.constexpr,
@@ -389,11 +403,9 @@ def parallel_simple_gla_bwd_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     NV: tl.constexpr,
-    USE_OFFSETS: tl.constexpr,
-    HEAD_FIRST: tl.constexpr,
-    USE_G: tl.constexpr
+    IS_VARLEN: tl.constexpr,
+    USE_G: tl.constexpr,
 ):
-    tl.static_assert(not (USE_OFFSETS and HEAD_FIRST), "USE_OFFSETS and HEAD_FIRST cannot be True at the same time")
     i_kv, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_k, i_v = i_kv // NV, i_kv % NV
     i_b, i_h = i_bh // H, i_bh % H
@@ -403,26 +415,23 @@ def parallel_simple_gla_bwd_kernel(
     if USE_G:
         dg += i_kv * B * H * T
 
-    if USE_OFFSETS:
-        i_n, i_t = tl.load(indices + i_t * 2).to(tl.int32), tl.load(indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(offsets + i_n).to(tl.int32), tl.load(offsets + i_n + 1).to(tl.int32)
+    if IS_VARLEN:
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
 
-    q += (i_bh * T * K) if HEAD_FIRST else (bos * H + i_h) * K
-    k += (i_bh * T * K) if HEAD_FIRST else (bos * H + i_h) * K
-    v += (i_bh * T * V) if HEAD_FIRST else (bos * H + i_h) * V
-    do += (i_bh * T * V) if HEAD_FIRST else (bos * H + i_h) * V
-    dq += (i_bh * T * K) if HEAD_FIRST else (bos * H + i_h) * K
-    dk += (i_bh * T * K) if HEAD_FIRST else (bos * H + i_h) * K
-    dv += (i_bh * T * V) if HEAD_FIRST else (bos * H + i_h) * V
+    q += (bos * H + i_h) * K
+    k += (bos * H + i_h) * K
+    v += (bos * H + i_h) * V
+    do += (bos * H + i_h) * V
+    dq += (bos * H + i_h) * K
+    dk += (bos * H + i_h) * K
+    dv += (bos * H + i_h) * V
     if USE_G:
-        g += (i_bh * T) if HEAD_FIRST else (bos * H + i_h)
-        dg += (i_bh * T) if HEAD_FIRST else (bos * H + i_h)
-    stride_qk = K if HEAD_FIRST else H * K
-    stride_vo = V if HEAD_FIRST else H * V
-    stride_g = 1 if HEAD_FIRST else H
+        g += bos * H + i_h
+        dg += bos * H + i_h
 
     parallel_simple_gla_bwd_kernel_dq(
         i_t=i_t,
@@ -436,17 +445,15 @@ def parallel_simple_gla_bwd_kernel(
         dq=dq,
         dg=dg,
         scale=scale,
-        stride_qk=stride_qk,
-        stride_vo=stride_vo,
-        stride_g=stride_g,
         T=T,
+        H=H,
         K=K,
         V=V,
         BT=BT,
         BS=BS,
         BK=BK,
         BV=BV,
-        USE_G=USE_G
+        USE_G=USE_G,
     )
     tl.debug_barrier()
     parallel_simple_gla_bwd_kernel_dkv(
@@ -462,17 +469,15 @@ def parallel_simple_gla_bwd_kernel(
         dv=dv,
         dg=dg,
         scale=scale,
-        stride_qk=stride_qk,
-        stride_vo=stride_vo,
-        stride_g=stride_g,
         T=T,
+        H=H,
         K=K,
         V=V,
         BT=BT,
         BS=BS,
         BK=BK,
         BV=BV,
-        USE_G=USE_G
+        USE_G=USE_G,
     )
 
 
@@ -484,14 +489,10 @@ def parallel_simple_gla_fwd(
     scale: float,
     output_attentions: bool = False,
     chunk_size: int = 128,
-    head_first: bool = True,
-    offsets: Optional[torch.LongTensor] = None,
-    indices: Optional[torch.LongTensor] = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_indices: torch.LongTensor | None = None,
 ):
-    if head_first:
-        B, H, T, K, V = *k.shape, v.shape[-1]
-    else:
-        B, T, H, K, V = *k.shape, v.shape[-1]
+    B, T, H, K, V = *k.shape, v.shape[-1]
     BT, BS = chunk_size, 32
     if check_shared_mem('hopper', k.device.index):
         BK = min(256, triton.next_power_of_2(K))
@@ -507,11 +508,13 @@ def parallel_simple_gla_fwd(
     NV = triton.cdiv(V, BV)
     assert BT % BS == 0
 
-    NT = triton.cdiv(T, BT) if offsets is None else len(indices)
+    if chunk_indices is None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size) if cu_seqlens is not None else None
+    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     # local cumulative decay in log space
     if g is not None:
-        g = chunk_local_cumsum(g, chunk_size, offsets=offsets, indices=indices, head_first=head_first)
+        g = chunk_local_cumsum(g, chunk_size, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices)
     grid = (NK * NV, NT, B * H)
     o = torch.empty(NK, *v.shape, dtype=v.dtype if NK == 1 else torch.float, device=q.device)
     attn = q.new_zeros(NK, B, H, T, T) if output_attentions else None
@@ -524,8 +527,8 @@ def parallel_simple_gla_fwd(
         o=o,
         attn=attn,
         scale=scale,
-        offsets=offsets,
-        indices=indices,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
         B=B,
         H=H,
         T=T,
@@ -535,7 +538,6 @@ def parallel_simple_gla_fwd(
         BS=BS,
         BK=BK,
         BV=BV,
-        HEAD_FIRST=head_first,
     )
     o = o.sum(0)
 
@@ -552,14 +554,10 @@ def parallel_simple_gla_bwd(
     do: torch.Tensor,
     scale: float,
     chunk_size: int = 128,
-    head_first: bool = True,
-    offsets: Optional[torch.LongTensor] = None,
-    indices: Optional[torch.LongTensor] = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_indices: torch.LongTensor | None = None,
 ):
-    if head_first:
-        B, H, T, K, V = *k.shape, v.shape[-1]
-    else:
-        B, T, H, K, V = *k.shape, v.shape[-1]
+    B, T, H, K, V = *k.shape, v.shape[-1]
     BT, BS = chunk_size, 32
     if check_shared_mem('hopper', k.device.index):
         BK = min(256, triton.next_power_of_2(K))
@@ -583,7 +581,9 @@ def parallel_simple_gla_bwd(
     dv = torch.empty(NK, * v.shape, dtype=v.dtype if NK == 1 else torch.float, device=q.device)
     dg = torch.empty(NK*NV, *g.shape, dtype=torch.float, device=q.device) if g is not None else None
 
-    NT = triton.cdiv(T, BT) if offsets is None else len(indices)
+    if chunk_indices is None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size) if cu_seqlens is not None else None
+    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     grid = (NK * NV, NT, B * H)
     parallel_simple_gla_bwd_kernel[grid](
@@ -596,8 +596,8 @@ def parallel_simple_gla_bwd(
         dk=dk,
         dv=dv,
         dg=dg,
-        offsets=offsets,
-        indices=indices,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
         scale=scale,
         T=T,
         B=B,
@@ -608,12 +608,11 @@ def parallel_simple_gla_bwd(
         BS=BS,
         BK=BK,
         BV=BV,
-        HEAD_FIRST=head_first
     )
     dq = dq.sum(0)
     dk = dk.sum(0)
     dv = dv.sum(0)
-    dg = chunk_global_cumsum(dg.sum(0), reverse=True, head_first=head_first, offsets=offsets) if g is not None else None
+    dg = chunk_global_cumsum(dg.sum(0), reverse=True, cu_seqlens=cu_seqlens) if g is not None else None
     return dq, dk, dv, dg
 
 
@@ -622,18 +621,12 @@ class ParallelSimpleGLAFunction(torch.autograd.Function):
     @staticmethod
     @input_guard
     @autocast_custom_fwd
-    def forward(ctx, q, k, v, g, scale, output_attentions, head_first, offsets):
+    def forward(ctx, q, k, v, g, scale, output_attentions, cu_seqlens, cu_seqlens_cpu):
         chunk_size = 128
         ctx.dtype = q.dtype
 
-        # 2-d indices denoting the offsets of chunks in each sequence
-        # for example, if the passed `offsets` is [0, 100, 356] and `chunk_size` is 64,
-        # then there are 2 and 4 chunks in the 1st and 2nd sequences respectively, and `indices` will be
-        # [[0, 0], [0, 1], [1, 0], [1, 1], [1, 2], [1, 3]]
-        indices = None
-        if offsets is not None:
-            indices = torch.cat([torch.arange(n) for n in triton.cdiv(offsets[1:] - offsets[:-1], chunk_size).tolist()])
-            indices = torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(offsets)
+        chunk_indices = prepare_chunk_indices(
+            cu_seqlens, chunk_size, cu_seqlens_cpu=cu_seqlens_cpu) if cu_seqlens is not None else None
 
         o, g, attn = parallel_simple_gla_fwd(
             q=q,
@@ -642,21 +635,20 @@ class ParallelSimpleGLAFunction(torch.autograd.Function):
             g=g,
             scale=scale,
             output_attentions=output_attentions,
-            head_first=head_first,
-            offsets=offsets,
-            indices=indices,
-            chunk_size=chunk_size)
-        ctx.save_for_backward(q, k, v, g, offsets, indices)
+            chunk_size=chunk_size,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
+        ctx.save_for_backward(q, k, v, g, cu_seqlens, chunk_indices)
         ctx.scale = scale
         ctx.chunk_size = chunk_size
-        ctx.head_first = head_first
         return o.to(q.dtype), attn
 
     @staticmethod
     @input_guard
     @autocast_custom_bwd
     def backward(ctx, do, da=None):
-        q, k, v, g, offsets, indices = ctx.saved_tensors
+        q, k, v, g, cu_seqlens, chunk_indices = ctx.saved_tensors
         dq, dk, dv, dg = parallel_simple_gla_bwd(
             q=q,
             k=k,
@@ -665,9 +657,9 @@ class ParallelSimpleGLAFunction(torch.autograd.Function):
             do=do,
             scale=ctx.scale,
             chunk_size=ctx.chunk_size,
-            offsets=offsets,
-            indices=indices,
-            head_first=ctx.head_first)
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
         return dq.to(q), dk.to(k), dv.to(v), dg.to(ctx.dtype) if dg is not None else None, None, None, None, None
 
 
@@ -675,48 +667,73 @@ def parallel_simple_gla(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: Optional[torch.Tensor] = None,
-    scale: Optional[float] = None,
+    g: torch.Tensor | None = None,
+    scale: float | None = None,
     output_attentions: bool = False,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    head_first: bool = True
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    cu_seqlens: torch.LongTensor | None = None,
+    cu_seqlens_cpu: torch.LongTensor | None = None,
+    head_first: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
     Args:
         q (torch.Tensor):
-            queries of shape `[B, H, T, K]` if `head_first=True` else `[B, T, H, K]`
+            queries of shape `[B, T, H, K]`.
         k (torch.Tensor):
-            keys of shape `[B, H, T, K]` if `head_first=True` else `[B, T, H, K]`
+            keys of shape `[B, T, H, K]`.
         v (torch.Tensor):
-            values of shape `[B, H, T, V]` if `head_first=True` else `[B, T, H, V]`
+            values of shape `[B, T, H, V]`.
         g (torch.Tensor):
-            Forget gates of shape `[B, H, T]` if `head_first=True` else `[B, T, H]`.
+            Forget gates of shape `[B, T, H]`.
             Compared to GLA, the gating is head-wise instead of elementwise.
-        scale (Optional[int]):
+        scale (Optional[float]):
             Scale factor for attention scores.
             If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
         output_attentions (bool):
             Whether to output the materialized attention scores of shape [B, H, T, T]. Default: `False`.
-        head_first (Optional[bool]):
-            Whether the inputs are in the head-first format. Default: `True`.
         cu_seqlens (torch.LongTensor):
             Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
             consistent with the FlashAttention API.
+        head_first (Optional[bool]):
+            Whether the inputs are in the head-first format. Default: `False`.
+            This argument has been deprecated.
 
     Returns:
         o (torch.Tensor):
-            Outputs of shape `[B, H, T, V]` if `head_first=True` else `[B, T, H, V]`.
+            Outputs of shape `[B, T, H, V]`.
         attn (torch.Tensor):
             Attention scores of shape `[B, H, T, T]` if `output_attentions=True` else `None`
     """
-    if scale is None:
-        scale = k.shape[-1] ** -0.5
+    if head_first:
+        raise DeprecationWarning(
+            "head_first is deprecated and will be removed in a future version. "
+            "Please use head_first=False for now instead.",
+        )
+    if not head_first and q.shape[1] < q.shape[2]:
+        warnings.warn(
+            f"Input tensor shape suggests potential format mismatch: seq_len ({q.shape[1]}) < num_heads ({q.shape[2]}). "
+            "This may indicate the inputs were passed in head-first format [B, H, T, ...] "
+            "when head_first=False was specified. "
+            "Please verify your input tensor format matches the expected shape [B, T, H, ...].",
+        )
     if cu_seqlens is not None:
-        assert q.shape[0] == 1, "batch size must be 1 when cu_seqlens are provided"
-        assert not head_first, "head_first must be False when cu_seqlens are provided"
-    if g is not None:
-        g = g.float()
+        if q.shape[0] != 1:
+            raise ValueError(
+                f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
+                f"Please flatten variable-length inputs before processing.",
+            )
     if output_attentions:
         assert cu_seqlens is None, "output_attentions=True is not supported with variable-length sequences"
-    o, attn = ParallelSimpleGLAFunction.apply(q, k, v, g, scale, output_attentions, head_first, cu_seqlens)
+
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+    o, attn = ParallelSimpleGLAFunction.apply(
+        q,
+        k,
+        v,
+        g,
+        scale,
+        output_attentions,
+        cu_seqlens,
+        cu_seqlens_cpu,
+    )
     return o, attn

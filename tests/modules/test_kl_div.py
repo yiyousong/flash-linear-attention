@@ -1,17 +1,16 @@
-# -*- coding: utf-8 -*-
-
-import os
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 from fla.modules import FusedKLDivLoss
-from fla.ops.utils.testing import assert_close
-from fla.utils import device, device_platform
-
-compiled_mode = os.getenv("COMPILER_MODE") == "1"
-ci_env = os.getenv("CI_ENV") == "1"
+from fla.utils import assert_close, device, device_platform
 
 
 @pytest.mark.parametrize("B", [2])
@@ -22,7 +21,7 @@ ci_env = os.getenv("CI_ENV") == "1"
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 @pytest.mark.skipif(
     device_platform == 'intel',
-    reason="Intel Triton Failure"
+    reason="Intel Triton Failure",
 )
 def test_fused(B: int, T: int, D: int, V: int, reduction: str, dtype: torch.dtype):
     torch.manual_seed(42)
@@ -34,7 +33,7 @@ def test_fused(B: int, T: int, D: int, V: int, reduction: str, dtype: torch.dtyp
     ref = F.kl_div(
         F.linear(x, x_weight).log_softmax(-1),
         F.linear(target_x, target_weight).softmax(-1),
-        reduction=reduction
+        reduction=reduction,
     ).to(dtype)
     do = torch.randn_like(ref).to(device)
     ref.backward(do)

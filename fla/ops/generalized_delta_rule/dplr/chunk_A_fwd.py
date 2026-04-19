@@ -1,144 +1,33 @@
-# -*- coding: utf-8 -*-
-# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-
-from typing import Optional
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import torch
 import triton
 import triton.language as tl
 
-from fla.ops.utils.op import exp
-from fla.utils import use_cuda_graph
+from fla.ops.utils import prepare_chunk_indices
+from fla.ops.utils.op import exp, gather
+from fla.utils import IS_AMD, IS_GATHER_SUPPORTED, USE_CUDA_GRAPH, autotune_cache_kwargs
+
+NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if IS_AMD else [2, 4, 8, 16, 32]
 
 
 @triton.heuristics({
-    'USE_OFFSETS': lambda args: args['offsets'] is not None
-})
-@triton.autotune(
-    configs=[
-        triton.Config({'BK': BK}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64]
-        for num_warps in [2, 4, 8, 16]
-        for num_stages in [2, 3, 4]
-    ],
-    key=['BC', 'K'],
-    use_cuda_graph=use_cuda_graph,
-)
-@triton.jit(do_not_specialize=['T'])
-def chunk_dplr_fwd_A_kernel_intra_sub_inter(
-    q,
-    k,
-    a,
-    b,
-    gi,  # cumsum
-    ge,  # before cumsum
-    Aqk,
-    Aqb,
-    Aab,
-    Aak,
-    offsets,
-    indices,
-    scale: tl.constexpr,
-    T,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    BT: tl.constexpr,
-    BC: tl.constexpr,
-    BK: tl.constexpr,
-    NC: tl.constexpr,
-    USE_OFFSETS: tl.constexpr,
-    HEAD_FIRST: tl.constexpr,
-):
-    i_t, i_c, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_b, i_h = i_bh // H, i_bh % H
-    i_i, i_j = i_c // NC, i_c % NC
-    if USE_OFFSETS:
-        i_n, i_t = tl.load(indices + i_t * 2).to(tl.int32), tl.load(indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(offsets + i_n).to(tl.int32), tl.load(offsets + i_n + 1).to(tl.int32)
-        T = eos - bos
-    else:
-        bos, eos = i_b * T, i_b * T + T
-
-    if i_t * BT + i_i * BC >= T:
-        return
-    if i_i <= i_j:
-        return
-
-    b_Aqk = tl.zeros([BC, BC], dtype=tl.float32)
-    b_Aqb = tl.zeros([BC, BC], dtype=tl.float32)
-    b_Aab = tl.zeros([BC, BC], dtype=tl.float32)
-    b_Aak = tl.zeros([BC, BC], dtype=tl.float32)
-    for i_k in range(tl.cdiv(K, BK)):
-        o_k = i_k * BK + tl.arange(0, BK)
-        m_k = o_k < K
-
-        if HEAD_FIRST:
-            p_q = tl.make_block_ptr(q + i_bh * T*K, (T, K), (K, 1), (i_t * BT + i_i * BC, i_k * BK), (BC, BK), (1, 0))
-            p_a = tl.make_block_ptr(a + i_bh * T*K, (T, K), (K, 1), (i_t * BT + i_i * BC, i_k * BK), (BC, BK), (1, 0))
-            p_gq_i = tl.make_block_ptr(gi + i_bh * T*K, (T, K), (K, 1), (i_t * BT + i_i * BC, i_k * BK), (BC, BK), (1, 0))
-            p_gq_e = tl.make_block_ptr(ge + i_bh * T*K, (T, K), (K, 1), (i_t * BT + i_i * BC, i_k * BK), (BC, BK), (1, 0))
-            p_k = tl.make_block_ptr(k + i_bh * T*K, (K, T), (1, K), (i_k * BK, i_t * BT + i_j * BC), (BK, BC), (0, 1))
-            p_b = tl.make_block_ptr(b + i_bh * T*K, (K, T), (1, K), (i_k * BK, i_t * BT + i_j * BC), (BK, BC), (0, 1))
-            p_gk = tl.make_block_ptr(gi + i_bh * T*K, (K, T), (1, K), (i_k * BK, i_t * BT + i_j * BC), (BK, BC), (0, 1))
-            p_gn = tl.max_contiguous(tl.multiple_of(gi + (i_bh * T + i_t * BT + i_i * BC - 1) * K + o_k, BK), BK)
-        else:
-            p_q = tl.make_block_ptr(q + (bos*H+i_h)*K, (T, K), (H*K, 1), (i_t * BT + i_i * BC, i_k * BK), (BC, BK), (1, 0))
-            p_a = tl.make_block_ptr(a + (bos*H+i_h)*K, (T, K), (H*K, 1), (i_t * BT + i_i * BC, i_k * BK), (BC, BK), (1, 0))
-            p_gq_i = tl.make_block_ptr(gi + (bos*H+i_h)*K, (T, K), (H*K, 1), (i_t * BT + i_i * BC, i_k * BK), (BC, BK), (1, 0))
-            p_gq_e = tl.make_block_ptr(ge + (bos*H+i_h)*K, (T, K), (H*K, 1), (i_t * BT + i_i * BC, i_k * BK), (BC, BK), (1, 0))
-            p_k = tl.make_block_ptr(k + (bos*H+i_h)*K, (K, T), (1, H*K), (i_k * BK, i_t * BT + i_j * BC), (BK, BC), (0, 1))
-            p_b = tl.make_block_ptr(b + (bos*H+i_h)*K, (K, T), (1, H*K), (i_k * BK, i_t * BT + i_j * BC), (BK, BC), (0, 1))
-            p_gk = tl.make_block_ptr(gi + (bos*H+i_h)*K, (K, T), (1, H*K), (i_k * BK, i_t * BT + i_j * BC), (BK, BC), (0, 1))
-            p_gn = gi + (bos + i_t * BT + i_i * BC - 1) * H*K + i_h * K + o_k
-        # [BK,]
-        b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)
-        # [BC, BK]
-        b_q = tl.load(p_q, boundary_check=(0, 1))
-        b_a = tl.load(p_a, boundary_check=(0, 1))
-        b_gq_i = tl.load(p_gq_i, boundary_check=(0, 1))
-        b_gq_e = tl.load(p_gq_e, boundary_check=(0, 1))
-        b_ag = b_a * exp(b_gq_e - b_gn[None, :])
-        b_qg = b_q * exp(b_gq_i - b_gn[None, :]) * scale
-        # [BK, BC]
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_b = tl.load(p_b, boundary_check=(0, 1))
-        b_gk = tl.load(p_gk, boundary_check=(0, 1)).to(tl.float32)
-        tmp = exp(b_gn[:, None] - b_gk)
-        b_kg = b_k * tmp
-        b_bg = b_b * tmp
-        # [BC, BC] using tf32 to improve precision here.
-        b_Aab += tl.dot(b_ag, b_bg)
-        b_Aak += tl.dot(b_ag, b_kg)
-        b_Aqk += tl.dot(b_qg, b_kg)
-        b_Aqb += tl.dot(b_qg, b_bg)
-
-    if HEAD_FIRST:
-        p_Aqk = tl.make_block_ptr(Aqk + i_bh*T*BT, (T, BT), (BT, 1), (i_t * BT + i_i * BC, i_j * BC), (BC, BC), (1, 0))
-        p_Aqb = tl.make_block_ptr(Aqb + i_bh*T*BT, (T, BT), (BT, 1), (i_t * BT + i_i * BC, i_j * BC), (BC, BC), (1, 0))
-        p_Aab = tl.make_block_ptr(Aab + i_bh*T*BT, (T, BT), (BT, 1), (i_t * BT + i_i * BC, i_j * BC), (BC, BC), (1, 0))
-        p_Aak = tl.make_block_ptr(Aak + i_bh*T*BT, (T, BT), (BT, 1), (i_t * BT + i_i * BC, i_j * BC), (BC, BC), (1, 0))
-    else:
-        p_Aqk = tl.make_block_ptr(Aqk + (bos*H+i_h)*BT, (T, BT), (H*BT, 1), (i_t * BT + i_i * BC, i_j * BC), (BC, BC), (1, 0))
-        p_Aqb = tl.make_block_ptr(Aqb + (bos*H+i_h)*BT, (T, BT), (H*BT, 1), (i_t * BT + i_i * BC, i_j * BC), (BC, BC), (1, 0))
-        p_Aab = tl.make_block_ptr(Aab + (bos*H+i_h)*BT, (T, BT), (H*BT, 1), (i_t * BT + i_i * BC, i_j * BC), (BC, BC), (1, 0))
-        p_Aak = tl.make_block_ptr(Aak + (bos*H+i_h)*BT, (T, BT), (H*BT, 1), (i_t * BT + i_i * BC, i_j * BC), (BC, BC), (1, 0))
-    tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-    tl.store(p_Aqb, b_Aqb.to(Aqb.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-    tl.store(p_Aab, b_Aab.to(Aab.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-    tl.store(p_Aak, b_Aak.to(Aak.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-
-
-@triton.heuristics({
-    'USE_OFFSETS': lambda args: args['offsets'] is not None
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8, 16, 32]
+        for num_warps in NUM_WARPS_AUTOTUNE
         for num_stages in [2, 3, 4]
     ],
     key=['BK', 'BT'],
-    use_cuda_graph=use_cuda_graph,
+    use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def chunk_dplr_fwd_A_kernel_intra_sub_intra(
@@ -156,8 +45,8 @@ def chunk_dplr_fwd_A_kernel_intra_sub_intra(
     Aqb,
     Aab,
     Aak,
-    offsets,
-    indices,
+    cu_seqlens,
+    chunk_indices,
     scale: tl.constexpr,
     T,
     H: tl.constexpr,
@@ -165,57 +54,39 @@ def chunk_dplr_fwd_A_kernel_intra_sub_intra(
     BT: tl.constexpr,
     BC: tl.constexpr,
     BK: tl.constexpr,
-    NC: tl.constexpr,
-    USE_OFFSETS: tl.constexpr,
-    HEAD_FIRST: tl.constexpr
+    IS_VARLEN: tl.constexpr,
+    GATHER_SUPPORTED: tl.constexpr,
 ):
-    i_t, i_i, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_b, i_h = i_bh // H, i_bh % H
-    i_j = i_i
-    if USE_OFFSETS:
-        i_n, i_t = tl.load(indices + i_t * 2).to(tl.int32), tl.load(indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(offsets + i_n).to(tl.int32), tl.load(offsets + i_n + 1).to(tl.int32)
+    i_t, i_b, i_h = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+
+    if IS_VARLEN:
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
 
-    if i_t * BT + i_i * BC >= T:
+    if i_t * BT >= T:
         return
 
     o_i = tl.arange(0, BC)
     o_k = tl.arange(0, BK)
     m_k = o_k < K
-    m_A = (i_t * BT + i_i * BC + tl.arange(0, BC)) < T
+    m_A = (i_t * BT + tl.arange(0, BC)) < T
     last_idx = min((i_t+1) * BT, T) - 1
-    if HEAD_FIRST:
-        o_A = i_bh * T*BT + (i_t * BT + i_i * BC + tl.arange(0, BC)) * BT + i_j * BC
-        p_q = tl.make_block_ptr(q + i_bh * T*K, (T, K), (K, 1), (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
-        p_k = tl.make_block_ptr(k + i_bh * T*K, (T, K), (K, 1), (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
-        p_a = tl.make_block_ptr(a + i_bh * T*K, (T, K), (K, 1), (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
-        p_b = tl.make_block_ptr(b + i_bh * T*K, (T, K), (K, 1), (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
-        p_gi = tl.make_block_ptr(gi + i_bh * T*K, (T, K), (K, 1), (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
-        p_ge = tl.make_block_ptr(ge + i_bh * T*K, (T, K), (K, 1), (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
-        p_g_last = gi + i_bh * T*K + last_idx * K + tl.arange(0, BK)
-        b_g_last = tl.load(p_g_last, mask=m_k, other=0)
-
-        p_qg = tl.make_block_ptr(qg + i_bh * T*K, (T, K), (K, 1), (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
-        p_kg = tl.make_block_ptr(kg + i_bh * T*K, (T, K), (K, 1), (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
-        p_ag = tl.make_block_ptr(ag + i_bh * T*K, (T, K), (K, 1), (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
-        p_bg = tl.make_block_ptr(bg + i_bh * T*K, (T, K), (K, 1), (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
-    else:
-        o_A = (bos + i_t * BT + i_i * BC + tl.arange(0, BC)) * H*BT + i_h * BT + i_j * BC
-        p_q = tl.make_block_ptr(q + (bos * H + i_h) * K, (T, K), (H*K, 1), (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
-        p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H*K, 1), (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
-        p_a = tl.make_block_ptr(a + (bos * H + i_h) * K, (T, K), (H*K, 1), (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
-        p_b = tl.make_block_ptr(b + (bos * H + i_h) * K, (T, K), (H*K, 1), (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
-        p_gi = tl.make_block_ptr(gi + (bos * H + i_h) * K, (T, K), (H*K, 1), (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
-        p_ge = tl.make_block_ptr(ge + (bos * H + i_h) * K, (T, K), (H*K, 1), (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
-        p_g_last = gi + (bos * H + i_h) * K + last_idx * H * K + tl.arange(0, BK)
-        b_g_last = tl.load(p_g_last, mask=m_k, other=0)
-        p_qg = tl.make_block_ptr(qg + (bos * H + i_h) * K, (T, K), (H*K, 1), (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
-        p_kg = tl.make_block_ptr(kg + (bos * H + i_h) * K, (T, K), (H*K, 1), (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
-        p_ag = tl.make_block_ptr(ag + (bos * H + i_h) * K, (T, K), (H*K, 1), (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
-        p_bg = tl.make_block_ptr(bg + (bos * H + i_h) * K, (T, K), (H*K, 1), (i_t * BT + i_i * BC, 0), (BC, BK), (1, 0))
+    o_A = (bos + i_t * BT + tl.arange(0, BC)) * H*BT + i_h * BT
+    p_q = tl.make_block_ptr(q + (bos * H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, 0), (BC, BK), (1, 0))
+    p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, 0), (BC, BK), (1, 0))
+    p_a = tl.make_block_ptr(a + (bos * H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, 0), (BC, BK), (1, 0))
+    p_b = tl.make_block_ptr(b + (bos * H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, 0), (BC, BK), (1, 0))
+    p_gi = tl.make_block_ptr(gi + (bos * H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, 0), (BC, BK), (1, 0))
+    p_ge = tl.make_block_ptr(ge + (bos * H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, 0), (BC, BK), (1, 0))
+    p_g_last = gi + (bos * H + i_h) * K + last_idx * H * K + tl.arange(0, BK)
+    b_g_last = tl.load(p_g_last, mask=m_k, other=0)
+    p_qg = tl.make_block_ptr(qg + (bos * H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, 0), (BC, BK), (1, 0))
+    p_kg = tl.make_block_ptr(kg + (bos * H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, 0), (BC, BK), (1, 0))
+    p_ag = tl.make_block_ptr(ag + (bos * H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, 0), (BC, BK), (1, 0))
+    p_bg = tl.make_block_ptr(bg + (bos * H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, 0), (BC, BK), (1, 0))
 
     b_q = tl.load(p_q, boundary_check=(0, 1))
     b_q = b_q * scale
@@ -236,33 +107,208 @@ def chunk_dplr_fwd_A_kernel_intra_sub_intra(
     tl.store(p_bg, b_bg.to(p_bg.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
     tl.store(p_ag, b_ag.to(p_ag.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
     tl.store(p_kg, b_kg.to(p_kg.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-    tl.debug_barrier()
+    # tl.debug_barrier()
 
     b_q = b_q.to(b_k.dtype)
     # inner attn
-    for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
+    for j in range(0, min(BC, T - i_t * BT)):
         # a trick to index the j-th row of b_k, b_g, b_b
-        mask = tl.arange(0, BC) == j
-        b_k_j = tl.sum(tl.where(mask[:, None], b_k, 0), 0)
-        b_gk_j = tl.sum(tl.where(mask[:, None], b_gi, 0), 0)
-        b_b_j = tl.sum(tl.where(mask[:, None], b_b, 0), 0)
-        tmp = exp(b_gi - b_gk_j[None, :])
-        b_A_qk = tl.sum(b_q * b_k_j[None, :] * tmp, 1)
-        b_A_qk = tl.where(o_i >= j, b_A_qk, 0.)
-        b_A_qb = tl.sum(b_q * b_b_j[None] * tmp, 1)
-        b_A_qb = tl.where(o_i >= j, b_A_qb, 0.)
-        tmp2 = exp(b_ge - b_gk_j[None, :])
-        b_A_ak = tl.sum(b_a * b_k_j[None, :] * tmp2, 1)
-        b_A_ak = tl.where(o_i > j, b_A_ak, 0.)
-        b_A_ab = tl.sum(b_a * b_b_j[None, :] * tmp2, 1)
-        b_A_ab = tl.where(o_i > j, b_A_ab, 0.)
+        if GATHER_SUPPORTED:
+            row_idx = tl.full([1, BK], j, dtype=tl.int16)
+            # [1, BK]
+            b_k_j = gather(b_k, row_idx, axis=0)
+            b_gk_j = gather(b_gi, row_idx, axis=0)
+            b_b_j = gather(b_b, row_idx, axis=0)
+        else:
+            mask = tl.arange(0, BC) == j
+            b_k_j = tl.sum(tl.where(mask[:, None], b_k, 0), 0)[None, :]
+            b_gk_j = tl.sum(tl.where(mask[:, None], b_gi, 0), 0)[None, :]
+            b_b_j = tl.sum(tl.where(mask[:, None], b_b, 0), 0)[None, :]
+        tmp = exp(b_gi - b_gk_j)
+        b_A_qk = tl.sum(b_q * b_k_j * tmp, 1)
+        m_i = (o_i >= j).to(tl.float32)
+        b_A_qk = b_A_qk * m_i
+        b_A_qb = tl.sum(b_q * b_b_j * tmp, 1)
+        b_A_qb = b_A_qb * m_i
+        tmp2 = exp(b_ge - b_gk_j)
+        b_A_ak = tl.sum(b_a * b_k_j * tmp2, 1)
+        m_i2 = (o_i > j).to(tl.float32)
+        b_A_ak = b_A_ak * m_i2
+        b_A_ab = tl.sum(b_a * b_b_j * tmp2, 1)
+        b_A_ab = b_A_ab * m_i2
+
         tl.store(Aqk + o_A + j, b_A_qk.to(dtype=Aqk.dtype.element_ty, fp_downcast_rounding="rtne"), mask=m_A)
         tl.store(Aqb + o_A + j, b_A_qb.to(dtype=Aqb.dtype.element_ty, fp_downcast_rounding="rtne"), mask=m_A)
         tl.store(Aab + o_A + j, b_A_ab.to(dtype=Aqb.dtype.element_ty, fp_downcast_rounding="rtne"), mask=m_A)
         tl.store(Aak + o_A + j, b_A_ak.to(dtype=Aqk.dtype.element_ty, fp_downcast_rounding="rtne"), mask=m_A)
 
 
-def chunk_fwd_intra_dplr_fn(
+@triton.heuristics({
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [4, 8]
+        for num_stages in [2, 3]
+    ],
+    key=['BK', 'BT'],
+    use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=['T'])
+def chunk_dplr_fwd_A_kernel_intra_tensorcore(
+    q,
+    k,
+    a,
+    b,
+    gi,
+    ge,
+    qg,
+    kg,
+    ag,
+    bg,
+    Aqk,
+    Aqb,
+    Aab,
+    Aak,
+    cu_seqlens,
+    chunk_indices,
+    scale: tl.constexpr,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    BT: tl.constexpr,
+    BC: tl.constexpr,
+    BK: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    GATHER_SUPPORTED: tl.constexpr,
+):
+    i_t, i_b, i_h = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+
+    if IS_VARLEN:
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T_len = eos - bos
+    else:
+        bos = i_b * T
+        T_len = T
+
+    if i_t * BT >= T_len:
+        return
+
+    # Compute base offset for all tensors
+    offset_base = (bos * H + i_h) * K
+
+    # Load the current chunk of Q, K, A, B and their gates
+    p_q = tl.make_block_ptr(q + offset_base, (T_len, K), (H*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    p_k = tl.make_block_ptr(k + offset_base, (T_len, K), (H*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    p_a = tl.make_block_ptr(a + offset_base, (T_len, K), (H*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    p_b = tl.make_block_ptr(b + offset_base, (T_len, K), (H*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    p_gi = tl.make_block_ptr(gi + offset_base, (T_len, K), (H*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    p_ge = tl.make_block_ptr(ge + offset_base, (T_len, K), (H*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+
+    b_q = tl.load(p_q, boundary_check=(0, 1))
+    b_k = tl.load(p_k, boundary_check=(0, 1))
+    b_a = tl.load(p_a, boundary_check=(0, 1))
+    b_b = tl.load(p_b, boundary_check=(0, 1))
+    b_gi_val = tl.load(p_gi, boundary_check=(0, 1)).to(tl.float32)
+    b_ge_val = tl.load(p_ge, boundary_check=(0, 1)).to(tl.float32)
+
+    # Calculate the index of the middle element of the valid part of the chunk
+    valid_len = min(T_len - i_t * BT, BT)
+    mid_idx = valid_len // 2
+
+    # Load the offset vector from Global Memory
+    # p_offset points to gi[i_t*BT + mid_idx, :]
+    m_k = tl.arange(0, BK) < K
+    p_offset = gi + offset_base + (i_t * BT + mid_idx) * K + tl.arange(0, BK)
+    b_offset = tl.load(p_offset, mask=m_k, other=0.0).to(tl.float32)
+
+    # Apply offset to gate values
+    # These operations broadcast [BK] to [BT, BK]
+    b_gi_val = b_gi_val - b_offset[None, :]
+    b_ge_val = b_ge_val - b_offset[None, :]
+
+    # Apply decay factors (now numerically safe)
+    # q_term ~ exp(gi - offset)
+    # k_term ~ exp(-gi + offset)
+    exp_gi = tl.exp(b_gi_val)
+    inv_exp_gi = tl.exp(-b_gi_val)
+    exp_ge = tl.exp(b_ge_val)
+
+    b_q = (b_q * scale).to(tl.float32)
+
+    # Compute gated operands for matrix multiplication
+    # q, k in l2 norm, < 1, i
+    q_ops = (b_q * exp_gi).to(tl.float32)
+    k_ops = (b_k * inv_exp_gi).to(tl.float32)
+    b_ops = (b_b * inv_exp_gi).to(tl.float32)
+    a_ops = (b_a * exp_ge).to(tl.float32)
+
+    # Load gate values at the last position for inter-chunk decay
+    last_idx = min((i_t+1) * BT, T_len) - 1
+    p_g_last = gi + offset_base + last_idx * H * K + tl.arange(0, BK)
+    b_g_last = tl.load(p_g_last, mask=m_k, other=0.0)
+
+    exp_offset = tl.exp(b_offset)
+    b_g_centered = b_g_last - b_offset
+    exp_g_centered = tl.exp(b_g_centered)
+
+    # Create pointers for writing
+    p_qg = tl.make_block_ptr(qg + offset_base, (T_len, K), (H*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    p_kg = tl.make_block_ptr(kg + offset_base, (T_len, K), (H*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    p_ag = tl.make_block_ptr(ag + offset_base, (T_len, K), (H*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    p_bg = tl.make_block_ptr(bg + offset_base, (T_len, K), (H*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+
+    # Store gated Q and A
+    tl.store(p_qg, (q_ops * exp_offset[None, :]).to(p_qg.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_ag, (a_ops * exp_offset[None, :]).to(p_ag.dtype.element_ty), boundary_check=(0, 1))
+
+    # Store gated K and B
+    b_kg_g = k_ops * exp_g_centered[None, :]
+    b_bg_g = b_ops * exp_g_centered[None, :]
+    tl.store(p_kg, b_kg_g.to(p_kg.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_bg, b_bg_g.to(p_bg.dtype.element_ty), boundary_check=(0, 1))
+
+    # Transpose K and B for dot product
+    k_ops_t = tl.trans(k_ops)
+    b_ops_t = tl.trans(b_ops)
+
+    # Compute intra-chunk attention using TensorCores
+    q_ops_h = q_ops.to(b_q.dtype)
+    b_A_qk = tl.dot(q_ops_h, k_ops_t.to(b_q.dtype))
+    b_A_qb = tl.dot(q_ops_h, b_ops_t.to(b_q.dtype))
+    b_A_ak = tl.dot(a_ops, k_ops_t)
+    b_A_ab = tl.dot(a_ops, b_ops_t)
+
+    # Create causal masks
+    offs_n = tl.arange(0, BT)
+    offs_m = tl.arange(0, BT)
+    mask_inclusive = offs_m[:, None] >= offs_n[None, :]
+    mask_strict = offs_m[:, None] > offs_n[None, :]
+
+    # Apply causal masking
+    b_A_qk = tl.where(mask_inclusive, b_A_qk, 0.0)
+    b_A_qb = tl.where(mask_inclusive, b_A_qb, 0.0)
+    b_A_ak = tl.where(mask_strict, b_A_ak, 0.0)
+    b_A_ab = tl.where(mask_strict, b_A_ab, 0.0)
+
+    # Store the intra-chunk attention matrices
+    offset_out_base = (bos * H + i_h) * BT
+
+    p_Aqk = tl.make_block_ptr(Aqk + offset_out_base, (T_len, BT), (H*BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
+    p_Aqb = tl.make_block_ptr(Aqb + offset_out_base, (T_len, BT), (H*BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
+    p_Aak = tl.make_block_ptr(Aak + offset_out_base, (T_len, BT), (H*BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
+    p_Aab = tl.make_block_ptr(Aab + offset_out_base, (T_len, BT), (H*BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
+
+    tl.store(p_Aqk, b_A_qk.to(p_Aqk.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_Aqb, b_A_qb.to(p_Aqb.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_Aak, b_A_ak.to(p_Aak.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_Aab, b_A_ab.to(p_Aab.dtype.element_ty), boundary_check=(0, 1))
+
+
+def chunk_dplr_fwd_intra(
     q: torch.Tensor,
     k: torch.Tensor,
     a: torch.Tensor,
@@ -271,44 +317,57 @@ def chunk_fwd_intra_dplr_fn(
     ge: torch.Tensor,
     scale: float,
     chunk_size: int,
-    offsets: Optional[torch.LongTensor] = None,
-    indices: Optional[torch.LongTensor] = None,
-    head_first: bool = True,
+    safe_gate: bool = False,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_indices: torch.LongTensor | None = None,
 ):
-    if head_first:
-        B, H, T, K = k.shape
-    else:
-        B, T, H, K = k.shape
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
-    NT = triton.cdiv(T, BT) if offsets is None else len(indices)
-    BC = min(16, BT)
-    NC = triton.cdiv(BT, BC)
+    B, T, H, K = k.shape
+    BT = chunk_size
 
-    Aqk = q.new_empty(B, *((H, T) if head_first else (T, H)), BT, dtype=q.dtype)
-    Aqb = q.new_empty(B, *((H, T) if head_first else (T, H)), BT, dtype=q.dtype)
+    if chunk_indices is None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
+    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+
+    Aqk = q.new_empty(B, T, H, BT, dtype=q.dtype)
+    Aqb = q.new_empty(B, T, H, BT, dtype=q.dtype)
     # involving matrix inverse and it'd be better to use float here.
-    Aab = q.new_empty(B, *((H, T) if head_first else (T, H)), BT, dtype=torch.float)
-    Aak = q.new_empty(B, *((H, T) if head_first else (T, H)), BT, dtype=torch.float)
-    grid = (NT, NC * NC, B * H)
+    Aab = q.new_empty(B, T, H, BT, dtype=torch.float)
+    Aak = q.new_empty(B, T, H, BT, dtype=torch.float)
 
-    chunk_dplr_fwd_A_kernel_intra_sub_inter[grid](
-        q=q, k=k, a=a, b=b, gi=gi, ge=ge, Aqk=Aqk, Aqb=Aqb, Aab=Aab, Aak=Aak,
-        offsets=offsets, indices=indices,
-        scale=scale,
-        T=T, H=H, K=K, BT=BT, BC=BC, NC=NC,
-        HEAD_FIRST=head_first
-    )
-    grid = (NT, NC, B * H)
-    BK = triton.next_power_of_2(K)
+    grid = (NT, B, H)
+    BK = max(triton.next_power_of_2(K), 16)
     qg = torch.empty_like(q)
     kg = torch.empty_like(k, dtype=q.dtype)
     ag = torch.empty_like(a, dtype=q.dtype)
     bg = torch.empty_like(b, dtype=q.dtype)
-    chunk_dplr_fwd_A_kernel_intra_sub_intra[grid](
-        q=q, k=k, a=a, b=b, gi=gi, ge=ge, Aqk=Aqk, Aqb=Aqb, Aab=Aab, Aak=Aak,
-        qg=qg, kg=kg, ag=ag, bg=bg,
-        offsets=offsets, indices=indices,
+    if safe_gate:
+        chunk_dplr_fwd_A_kernel_intra_func = chunk_dplr_fwd_A_kernel_intra_tensorcore
+    else:
+        chunk_dplr_fwd_A_kernel_intra_func = chunk_dplr_fwd_A_kernel_intra_sub_intra
+    chunk_dplr_fwd_A_kernel_intra_func[grid](
+        q=q,
+        k=k,
+        a=a,
+        b=b,
+        gi=gi,
+        ge=ge,
+        Aqk=Aqk,
+        Aqb=Aqb,
+        Aab=Aab,
+        Aak=Aak,
+        qg=qg,
+        kg=kg,
+        ag=ag,
+        bg=bg,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
         scale=scale,
-        T=T, H=H, K=K, BT=BT, BC=BC, BK=BK, HEAD_FIRST=head_first, NC=NC
+        T=T,
+        H=H,
+        K=K,
+        BT=BT,
+        BC=BT,
+        BK=BK,
+        GATHER_SUPPORTED=IS_GATHER_SUPPORTED,
     )
     return Aab, Aqk, Aak, Aqb, qg, kg, ag, bg

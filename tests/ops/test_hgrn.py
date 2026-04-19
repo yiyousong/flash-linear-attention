@@ -1,4 +1,9 @@
-# -*- coding: utf-8 -*-
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import os
 
@@ -8,38 +13,27 @@ import torch.nn.functional as F
 
 from fla.ops.hgrn import chunk_hgrn, fused_recurrent_hgrn
 from fla.ops.hgrn.naive import naive_recurrent_hgrn
-from fla.ops.utils.testing import assert_close
-from fla.utils import device
-
-compiled_mode = os.getenv("COMPILER_MODE") == "1"
-if compiled_mode:
-    test_b_list = [1]
-    test_t_list = [64]
-    test_t_varlen_list = test_t_list
-    test_d_list = [500, 1024]
-    test_gate_list = [1.0]
-else:
-    test_b_list = [2]
-    test_t_list = [1, 15, 63, 300]
-    test_t_varlen_list = [63, 286, 300, 512]
-    test_d_list = [500, 1024]
-    test_gate_list = [1, 0.1, 10]
-test_h_list = [2]
+from fla.utils import assert_close, device
 
 
-@pytest.mark.parametrize("B", test_b_list)
-@pytest.mark.parametrize("T", test_t_list)
-@pytest.mark.parametrize("D", test_d_list)
-@pytest.mark.parametrize("dtype", [torch.float])
-@pytest.mark.skipif(
-    os.getenv("SKIP_TEST_CHUNK_VARLEN") == "0",
-    reason="Skipping test because TEST_CHUNK_VARLEN is enabled"
+@pytest.mark.parametrize(
+    ('B', 'T', 'D', 'dtype'),
+    [
+        pytest.param(*test, id="B{}-T{}-D{}-{}".format(*test))
+        for test in [
+            (1, 63, 500, torch.float),
+            (2, 1024, 500, torch.float),
+            (2, 1024, 512, torch.float),
+            (2, 1024, 1000, torch.float),
+            (4, 2048, 2048, torch.float),
+        ]
+    ],
 )
 def test_fused_recurrent(
     B: int,
     T: int,
     D: int,
-    dtype: torch.dtype
+    dtype: torch.dtype,
 ):
     torch.manual_seed(42)
     os.environ['TRITON_F32_DEFAULT'] = 'ieee'
@@ -64,35 +58,36 @@ def test_fused_recurrent(
     tri_dg, g.grad = g.grad.clone(), None
     tri_dh0, h0.grad = h0.grad.clone(), None
 
-    assert_close("o", ref, tri, 0.005)
-    assert_close("ht", ref_ht, tri_ht, 0.005)
-    assert_close("dx", ref_dx, tri_dx, 0.005)
-    assert_close("dg", ref_dg, tri_dg, 0.005)
-    assert_close("dh0", ref_dh0, tri_dh0, 0.005)
+    assert_close('o', ref, tri, 0.005)
+    assert_close('ht', ref_ht, tri_ht, 0.005)
+    assert_close('dx', ref_dx, tri_dx, 0.005)
+    assert_close('dg', ref_dg, tri_dg, 0.005)
+    assert_close('dh0', ref_dh0, tri_dh0, 0.005)
 
 
-@pytest.mark.parametrize("N", test_b_list)
-@pytest.mark.parametrize("T", test_t_list)
-@pytest.mark.parametrize("D", test_d_list)
-@pytest.mark.parametrize("dtype", [torch.float])
-@pytest.mark.skipif(
-    os.getenv("SKIP_TEST_CHUNK_VARLEN") == "0",
-    reason="Skipping test because TEST_CHUNK_VARLEN is enabled"
+@pytest.mark.parametrize(
+    ('D', 'cu_seqlens', 'dtype'),
+    [
+        pytest.param(*test, id="D{}-cu_seqlens{}-{}".format(*test))
+        for test in [
+            (500, [0, 15], torch.float),
+            (512, [0, 256, 500, 1000], torch.float),
+            (1000, [0, 15, 100, 300, 1200, 2000], torch.float),
+            (2048, [0, 200, 512, 1200, 2048], torch.float16),
+        ]
+    ],
 )
 def test_fused_recurrent_varlen(
-    N: int,
-    T: int,
     D: int,
-    dtype: torch.dtype
+    cu_seqlens: list[int],
+    dtype: torch.dtype,
 ):
     torch.manual_seed(42)
     os.environ['TRITON_F32_DEFAULT'] = 'ieee'
-    # randomly split the sequence into N segments
-    offsets = torch.cat([
-        torch.tensor([0], dtype=torch.long),
-        torch.arange(16, T)[torch.randperm(T - 1)[:N-1]],
-        torch.tensor([T], dtype=torch.long)
-    ], 0).to(device).sort()[0]
+
+    N = len(cu_seqlens) - 1
+    T = cu_seqlens[-1]
+    cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
 
     x = torch.randn((1, T, D), dtype=dtype, device=device)
     g = torch.randn((1, T, D), dtype=dtype, device=device)
@@ -105,10 +100,10 @@ def test_fused_recurrent_varlen(
     refs, ref_hts = [], []
     for i in range(N):
         ref, ref_ht = naive_recurrent_hgrn(
-            x[:, offsets[i]:offsets[i+1]],
-            g[:, offsets[i]:offsets[i+1]],
+            x[:, cu_seqlens[i]:cu_seqlens[i+1]],
+            g[:, cu_seqlens[i]:cu_seqlens[i+1]],
             h0[i:i+1],
-            output_final_state=True
+            output_final_state=True,
         )
         refs.append(ref)
         ref_hts.append(ref_ht)
@@ -119,32 +114,36 @@ def test_fused_recurrent_varlen(
     ref_dg, g.grad = g.grad.clone(), None
     ref_dh0, h0.grad = h0.grad.clone(), None
 
-    tri, tri_ht = fused_recurrent_hgrn(x, g, h0, output_final_state=True, cu_seqlens=offsets)
+    tri, tri_ht = fused_recurrent_hgrn(x, g, h0, output_final_state=True, cu_seqlens=cu_seqlens)
     ((tri * do).sum() + (tri_ht * dht).sum()).backward()
     tri_dx, x.grad = x.grad.clone(), None
     tri_dg, g.grad = g.grad.clone(), None
     tri_dh0, h0.grad = h0.grad.clone(), None
 
-    assert_close(" o", ref, tri, 0.005)
-    assert_close("ht", ref_ht, tri_ht, 0.005)
-    assert_close("dx", ref_dx, tri_dx, 0.005)
-    assert_close("dg", ref_dg, tri_dg, 0.005)
-    assert_close("dh0", ref_dh0, tri_dh0, 0.005)
+    assert_close('o', ref, tri, 0.005)
+    assert_close('ht', ref_ht, tri_ht, 0.005)
+    assert_close('dx', ref_dx, tri_dx, 0.005)
+    assert_close('dg', ref_dg, tri_dg, 0.005)
+    assert_close('dh0', ref_dh0, tri_dh0, 0.005)
 
 
-@pytest.mark.parametrize("B", test_b_list)
-@pytest.mark.parametrize("T", test_t_list)
-@pytest.mark.parametrize("D", test_d_list)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float])
-@pytest.mark.skipif(
-    os.getenv("SKIP_TEST_CHUNK_VARLEN") == "0",
-    reason="Skipping test because TEST_CHUNK_VARLEN is enabled"
+@pytest.mark.parametrize(
+    ('B', 'T', 'D', 'dtype'),
+    [
+        pytest.param(*test, id="B{}-T{}-D{}-{}".format(*test))
+        for test in [
+            (1, 63, 500, torch.float16),
+            (2, 500, 1000, torch.float16),
+            (2, 1000, 1024, torch.float16),
+            (4, 2048, 2048, torch.float16),
+        ]
+    ],
 )
 def test_chunk(
     B: int,
     T: int,
     D: int,
-    dtype: torch.dtype
+    dtype: torch.dtype,
 ):
     torch.manual_seed(42)
     os.environ['TRITON_F32_DEFAULT'] = 'ieee'
@@ -166,6 +165,6 @@ def test_chunk(
     tri_dx, x.grad = x.grad.clone(), None
     tri_dg, g.grad = g.grad.clone(), None
 
-    assert_close(" o", ref, tri, 0.005)
-    assert_close("dx", ref_dx, tri_dx, 0.005)
-    assert_close("dg", ref_dg, tri_dg, 0.005)
+    assert_close('o', ref, tri, 0.005)
+    assert_close('dx', ref_dx, tri_dx, 0.005)
+    assert_close('dg', ref_dg, tri_dg, 0.005)
