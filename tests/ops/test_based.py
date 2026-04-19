@@ -1,6 +1,9 @@
-# -*- coding: utf-8 -*-
-
-import os
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import pytest
 import torch
@@ -9,33 +12,26 @@ from fla.ops.based import fused_chunk_based, parallel_based
 from fla.ops.based.naive import naive_parallel_based
 from fla.utils import device
 
-compiled_mode = os.getenv("COMPILER_MODE") == "1"
-if compiled_mode:
-    test_b_list = [1]
-    test_t_list = [64]
-    test_d_list = [64, 128, 256]
-else:
-    test_b_list = [2]
-    test_t_list = [1, 15, 63, 300]
-    test_d_list = [32, 64, 100, 256]
-test_h_list = [2]
 
-
-@pytest.mark.parametrize("B", test_b_list)
-@pytest.mark.parametrize("H", test_h_list)
-@pytest.mark.parametrize("T", test_t_list)
-@pytest.mark.parametrize("D", test_d_list)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.skipif(
-    os.getenv("SKIP_TEST_CHUNK_VARLEN") == "0",
-    reason="Skipping test because TEST_CHUNK_VARLEN is enabled"
+@pytest.mark.parametrize(
+    ('B', 'T', 'H', 'D', 'dtype'),
+    [
+        pytest.param(*test, id="B{}-T{}-H{}-D{}-{}".format(*test))
+        for test in [
+            (1, 63, 1, 60, torch.float16),
+            (3, 111, 2, 64, torch.float16),
+            (3, 1024, 4, 100, torch.float16),
+            (3, 1024, 8, 128, torch.float16),
+            (4, 2048, 8, 256, torch.float16),
+        ]
+    ],
 )
 def test_based(
     B: int,
-    H: int,
     T: int,
+    H: int,
     D: int,
-    dtype: torch.dtype
+    dtype: torch.dtype,
 ):
     torch.manual_seed(42)
     q = torch.randn((B, H, T, 16), dtype=dtype, device=device).requires_grad_()

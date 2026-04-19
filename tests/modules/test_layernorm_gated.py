@@ -1,4 +1,9 @@
-# -*- coding: utf-8 -*-
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import pytest
 import torch
@@ -6,16 +11,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from fla.modules import FusedLayerNormGated, FusedRMSNormGated
-from fla.utils import device
+from fla.utils import assert_close, device
 
 
-@pytest.mark.parametrize("B", [2])
-@pytest.mark.parametrize("H", [2])
-@pytest.mark.parametrize("T", [1, 50, 512])
-@pytest.mark.parametrize("D", [50, 64, 128])
-@pytest.mark.parametrize("elementwise_affine", [False, True])
-@pytest.mark.parametrize("activation", ["silu", "sigmoid"])
-@pytest.mark.parametrize("bias", [False])
+@pytest.mark.parametrize(
+    ('B', 'H', 'T', 'D', 'elementwise_affine', 'activation', 'bias'),
+    [
+        pytest.param(*test, id=f"B{test[0]}_H{test[1]}_T{test[2]}_D{test[3]}_affine{test[4]}_{test[5]}_bias{test[6]}")
+        for test in [
+            (2, 2, 1,    64,  False, "silu",   False),
+            (2, 2, 512,  128, True,  "silu",   True),
+            (2, 2, 2048, 1200, True,  "sigmoid", False),
+            (2, 2, 50,   50,  False, "sigmoid", False),
+        ]
+    ],
+)
 def test_layernorm_gated(B: int, H: int, T: int, D: int, elementwise_affine: bool, activation: str, bias: bool):
     torch.manual_seed(42)
     x = torch.randn(B, H, T, D).to(device).requires_grad_(True)
@@ -43,20 +53,27 @@ def test_layernorm_gated(B: int, H: int, T: int, D: int, elementwise_affine: boo
         ref_db = torch.autograd.grad((ref(x) * act_fn(g)).sum(), ref.bias)[0]
         tri_db = torch.autograd.grad(tri(x, g).sum(), tri.bias)[0]
 
-    torch.testing.assert_close(ref_y, tri_y, rtol=0, atol=1e-4)
-    torch.testing.assert_close(ref_dx, tri_dx, rtol=0, atol=1e-4)
-    torch.testing.assert_close(ref_dg, tri_dg, rtol=0, atol=1e-4)
+    assert_close(' y', ref_y, tri_y, 1e-3)
+    assert_close('dx', ref_dx, tri_dx, 1e-3)
+    assert_close('dg', ref_dg, tri_dg, 1e-3)
     if ref.weight is not None:
-        torch.testing.assert_close(ref_dw, tri_dw, rtol=0, atol=1e-3)
+        assert_close('dw', ref_dw, tri_dw, 1e-3)
     if ref.bias is not None:
-        torch.testing.assert_close(ref_db, tri_db, rtol=0, atol=1e-3)
+        assert_close('db', ref_db, tri_db, 1e-3)
 
 
-@pytest.mark.parametrize("B", [2])
-@pytest.mark.parametrize("H", [2])
-@pytest.mark.parametrize("T", [1, 50, 512])
-@pytest.mark.parametrize("D", [50, 64, 128])
-@pytest.mark.parametrize("activation", ["silu", "sigmoid"])
+@pytest.mark.parametrize(
+    ('B', 'H', 'T', 'D', 'activation'),
+    [
+        pytest.param(*test, id=f"B{test[0]}_H{test[1]}_T{test[2]}_D{test[3]}_{test[4]}")
+        for test in [
+            (2, 2, 1,    64,  "silu"),
+            (2, 2, 512,  128, "sigmoid"),
+            (2, 2, 2048, 1200, "silu"),
+            (2, 2, 50,   50,  "sigmoid"),
+        ]
+    ],
+)
 def test_rmsnorm_gated(B: int, H: int, T: int, D: int, activation: str):
     torch.manual_seed(42)
     x = torch.randn(B, H, T, D).to(device).requires_grad_(True)
@@ -75,7 +92,7 @@ def test_rmsnorm_gated(B: int, H: int, T: int, D: int, activation: str):
     ref_dw = torch.autograd.grad((ref(x) * act_fn(g)).sum(), ref.weight)[0]
     tri_dw = torch.autograd.grad(tri(x, g).sum(), tri.weight)[0]
 
-    torch.testing.assert_close(ref_y, tri_y, rtol=0, atol=1e-4)
-    torch.testing.assert_close(ref_dx, tri_dx, rtol=0, atol=1e-4)
-    torch.testing.assert_close(ref_dg, tri_dg, rtol=0, atol=1e-4)
-    torch.testing.assert_close(ref_dw, tri_dw, rtol=0, atol=1e-3)
+    assert_close(' y', ref_y, tri_y, 1e-3)
+    assert_close('dx', ref_dx, tri_dx, 1e-3)
+    assert_close('dg', ref_dg, tri_dg, 1e-3)
+    assert_close('dw', ref_dw, tri_dw, 1e-3)

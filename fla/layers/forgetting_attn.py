@@ -1,9 +1,13 @@
-# -*- coding: utf-8 -*-
-# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -12,12 +16,13 @@ import torch.utils.checkpoint
 from einops import rearrange
 from transformers.utils import logging
 
-from fla.modules import RMSNorm
+from fla.layers.utils import pad_input, unpad_input
+from fla.modules import GroupNorm
+from fla.ops.attn.decoding import attn_decoding_one_step
 from fla.ops.forgetting_attn.parallel import parallel_forgetting_attn
 
 if TYPE_CHECKING:
     from fla.models.utils import Cache
-
 
 logger = logging.get_logger(__name__)
 
@@ -28,12 +33,12 @@ class ForgettingAttention(nn.Module):
         self,
         hidden_size: int = 2048,
         num_heads: int = 32,
-        num_kv_heads: Optional[int] = None,
+        num_kv_heads: int | None = None,
         qkv_bias: bool = False,
         qk_norm: bool = False,
-        window_size: Optional[int] = None,
+        window_size: int | None = None,
         use_output_gate: bool = False,
-        layer_idx: int = None
+        layer_idx: int = None,
     ):
         super().__init__()
 
@@ -63,18 +68,26 @@ class ForgettingAttention(nn.Module):
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
 
         if qk_norm:
-            self.q_norm = RMSNorm(self.head_dim)
-            self.k_norm = RMSNorm(self.head_dim)
+            self.q_norm = GroupNorm(
+                num_groups=self.num_heads,
+                hidden_size=self.hidden_size,
+                is_rms_norm=True,
+            )
+            self.k_norm = GroupNorm(
+                num_groups=self.num_kv_heads,
+                hidden_size=self.kv_dim,
+                is_rms_norm=True,
+            )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
+        attention_mask: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
         if attention_mask is not None:
             assert len(attention_mask.shape) == 2, (
                 "Expected attention_mask as a 0-1 matrix with shape [batch_size, seq_len] "
@@ -82,20 +95,44 @@ class ForgettingAttention(nn.Module):
                 "Arbitrary attention masks of shape [batch_size, seq_len, seq_len] are not allowed."
             )
 
-        cu_seqlens = kwargs.get('cu_seqlens', None)
+        batch_size, q_len, _ = hidden_states.size()
+
         q, k, v = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
         f = F.logsigmoid(self.f_proj(hidden_states).float())
+        if self.qk_norm:
+            q, k = self.q_norm(q), self.k_norm(k)
+
+        cu_seqlens = kwargs.get('cu_seqlens')
+        if past_key_values is not None:
+            assert cu_seqlens is None, "cu_seqlens should not be provided when past_key_values is not None"
+            state = past_key_values.update(
+                attn_state=(k, v, f),
+                layer_idx=self.layer_idx,
+                offset=q_len,
+                cache_kwargs=dict(window_size=self.window_size),
+            )
+            k, v, f = state['attn_state']
 
         q = rearrange(q, '... (h d) -> ... h d', d=self.head_dim)
         k = rearrange(k, '... (h d) -> ... h d', d=self.head_dim)
         v = rearrange(v, '... (h d) -> ... h d', d=self.head_dim)
-        if self.qk_norm:
-            q, k = self.q_norm(q), self.k_norm(k)
 
-        o = parallel_forgetting_attn(q, k, v, f, cu_seqlens=cu_seqlens)
+        if attention_mask is not None:
+            q, (k, v, f), indices_q, cu_seqlens, max_seq_lens = unpad_input(q, (k, v, f), attention_mask, q_len, keepdim=True)
+            _, cu_seqlens_k = cu_seqlens
+            cu_seqlens = cu_seqlens_k
+            max_seqlen_q, max_seqlen_k = max_seq_lens
+            if max_seqlen_q != max_seqlen_k:
+                assert max_seqlen_q == 1, "only support q_len == 1 for decoding"
+                o = attn_decoding_one_step(q, k, v, f, cu_seqlens=cu_seqlens)
+            else:
+                o = parallel_forgetting_attn(q, k, v, f, cu_seqlens=cu_seqlens)
+        else:
+            o = parallel_forgetting_attn(q, k, v, f, cu_seqlens=cu_seqlens)
+        if attention_mask is not None:
+            o = pad_input(o.squeeze(0), indices_q, batch_size, q_len)
         o = rearrange(o, '... h d -> ... (h d)')
         if self.use_output_gate:
             o = self.g_proj(hidden_states).sigmoid() * o
         o = self.o_proj(o)
-
         return o, None, past_key_values

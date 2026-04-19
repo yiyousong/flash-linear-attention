@@ -1,6 +1,9 @@
-# -*- coding: utf-8 -*-
-
-from typing import Optional
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import torch
 
@@ -14,11 +17,11 @@ def naive_recurrent_gla(
     k: torch.Tensor,
     v: torch.Tensor,
     gk: torch.Tensor,
-    initial_state: Optional[torch.Tensor] = None,
-    output_final_state: bool = False
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
 ):
     dtype = q.dtype
-    q, k, v, gk = map(lambda x: x.float(), (q, k, v, gk))
+    q, k, v, gk = map(lambda x: x.transpose(1, 2).float(), (q, k, v, gk))
     B, H, T, K, V = *q.shape, v.shape[-1]
     o = torch.zeros_like(v)
     scale = K ** -0.5
@@ -38,4 +41,4 @@ def naive_recurrent_gla(
 
     if not output_final_state:
         h = None
-    return o.to(dtype), h
+    return o.transpose(1, 2).to(dtype), h

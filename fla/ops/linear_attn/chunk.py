@@ -1,7 +1,9 @@
-# -*- coding: utf-8 -*-
-# Copyright (c) 2023-2025, Yu Zhang, Songlin Yang
-
-from typing import Optional, Tuple
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import torch
 
@@ -14,52 +16,60 @@ def chunk_linear_attn(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    scale: Optional[float] = None,
-    initial_state: Optional[torch.Tensor] = None,
+    scale: float | None = None,
+    initial_state: torch.Tensor | tuple | None = None,
     output_final_state: bool = False,
     normalize: bool = True,
-    head_first: bool = True
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
     Args:
         q (torch.Tensor):
-            queries of shape `[B, H, T, K]` if `head_first=True` else `[B, T, H, K]`
+            queries of shape `[B, T, H, K]`.
         k (torch.Tensor):
-            keys of shape `[B, H, T, K]` if `head_first=True` else `[B, T, H, K]`
+            keys of shape `[B, T, H, K]`.
         v (torch.Tensor):
-            values of shape `[B, H, T, V]` if `head_first=True` else `[B, T, H, V]`
-        scale (Optional[int]):
+            values of shape `[B, T, H, V]`.
+        scale (Optional[float]):
             Scale factor for the linear attention scores.
             If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
-        initial_state (Optional[torch.Tensor]):
-            Initial state of shape `[B, H, K, V]`. Default: `None`.
+        initial_state (Optional[torch.Tensor | tuple]):
+            Initial recurrent state. When `normalize=False`, a tensor of shape `[B, H, K, V]`.
+            When `normalize=True`, a tuple `(kv_state, z_state)` where `z_state` has shape
+            `[B, 1, H, K]` (running cumulative key for the denominator). Default: `None`.
         output_final_state (Optional[bool]):
-            Whether to output the final state of shape `[B, H, K, V]`. Default: `False`.
+            Whether to output the final state. Default: `False`.
         normalize (bool):
             Whether to normalize the output. Default: `True`.
-        head_first (Optional[bool]):
-            Whether the inputs are in the head-first format. Default: `True`.
 
     Returns:
         o (torch.Tensor):
-            Outputs of shape `[B, H, T, V]` if `head_first=True` else `[B, T, H, V]`
-        final_state (torch.Tensor):
-            Final state of shape `[B, H, K, V]` if `output_final_state=True` else `None`
+            Outputs of shape `[B, T, H, V]`.
+        final_state (torch.Tensor | tuple | None):
+            Mirrors the shape of `initial_state`: a tensor when `normalize=False`, a
+            `(kv_state, z_state)` tuple when `normalize=True`, or `None` when
+            `output_final_state=False`.
     """
-
+    if q.shape[1] < q.shape[2]:
+        raise DeprecationWarning(
+            f"Input tensor shape suggests potential format mismatch: seq_len ({q.shape[1]}) < num_heads ({q.shape[2]}). "
+            "This may indicate the inputs were passed in head-first format [B, H, T, ...]. "
+            "Please verify your input tensor format matches the expected shape [B, T, H, ...].",
+        )
+    if normalize and isinstance(initial_state, tuple):
+        kv_init, z_init = initial_state
+    else:
+        kv_init, z_init = initial_state, None
     if scale is None:
         scale = k.shape[-1] ** -0.5
-
     o, final_state = chunk_simple_gla(
         q=q,
         k=k,
         v=v,
         scale=scale,
-        g=None,
-        initial_state=initial_state,
+        initial_state=kv_init,
         output_final_state=output_final_state,
-        head_first=head_first
     )
     if normalize:
-        o = normalize_output(q * scale, k, o)
+        o, z_state = normalize_output(q * scale, k, o, z_init)
+        return o, (final_state, z_state)
     return o, final_state

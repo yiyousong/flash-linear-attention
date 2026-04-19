@@ -1,5 +1,9 @@
-# -*- coding: utf-8 -*-
-# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang, Yuqi Pan
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import torch
 import torch.nn.functional as F
@@ -17,7 +21,7 @@ def ttt_linear(
     mini_batch_size: int,
     initial_state: torch.Tensor,
     initial_state_bias: torch.Tensor,
-    output_final_state: bool
+    output_final_state: bool,
 ):
     B, H, T, D = q.shape
     BT = mini_batch_size
@@ -83,7 +87,7 @@ def chunk_ttt_linear_ref(
     initial_state: torch.Tensor = None,
     initial_state_bias: torch.Tensor = None,
     output_final_state: bool = False,
-    head_first: bool = True,
+    head_first: bool = False,
 ):
     assert q.dtype == k.dtype == v.dtype
     assert k.shape[-1] == v.shape[-1], "The key and value dimension must be the same."

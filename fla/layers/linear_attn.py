@@ -1,26 +1,38 @@
-# -*- coding: utf-8 -*-
-# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
-from typing import Optional
+from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
+from fla.layers.utils import get_layer_cache, update_layer_cache
 from fla.modules import RMSNorm
 from fla.modules.feature_map import DPFPFeatureMap, HadamardFeatureMap, HedgehogFeatureMap, T2RFeatureMap
 from fla.ops.linear_attn import chunk_linear_attn, fused_chunk_linear_attn, fused_recurrent_linear_attn
 
+if TYPE_CHECKING:
+    from fla.models.utils import Cache
+
 
 class LinearAttention(nn.Module):
+
     def __init__(
         self,
         mode: str = 'chunk',
         hidden_size: str = 1024,
-        expand_k: int = 1.0,
-        expand_v: int = 1.0,
+        expand_k: float = 1.0,
+        expand_v: float = 1.0,
         num_heads: int = 8,
-        num_kv_heads: Optional[int] = None,
+        num_kv_heads: int | None = None,
         feature_map: str = 'elementwise_product',
         tie_feature_map_qk: bool = False,
         output_norm: str = 'rmsnorm',
@@ -29,7 +41,8 @@ class LinearAttention(nn.Module):
         do_feature_map_norm: bool = False,
         elementwise_affine: bool = True,
         norm_eps: float = 1e-5,
-        **kwargs
+        layer_idx: int | None = None,
+        **kwargs,
     ):
         super().__init__()
 
@@ -43,13 +56,14 @@ class LinearAttention(nn.Module):
         self.key_dim_per_group = self.key_dim // self.num_kv_groups
         self.value_dim_per_group = self.value_dim // self.num_kv_groups
 
-        assert mode in ['chunk', 'fused_chunk', 'fused_recurrent'], f"Not suppoerted mode `{mode}`."
+        assert mode in ['chunk', 'fused_chunk', 'fused_recurrent'], f"Not supported mode `{mode}`."
         assert self.key_dim % num_heads == 0, f"key dim must be divisible by num_heads of {num_heads}"
         assert self.value_dim % num_heads == 0, f"value dim must be divisible by num_heads of {num_heads}"
 
         self.head_k_dim = self.key_dim // num_heads
         self.head_v_dim = self.value_dim // num_heads
         self.do_feature_map_norm = do_feature_map_norm
+        self.layer_idx = layer_idx
 
         if feature_map == 'hedgehog':
             if tie_feature_map_qk:
@@ -97,7 +111,8 @@ class LinearAttention(nn.Module):
         self.v_proj = nn.Linear(hidden_size, self.value_dim_per_group, bias=False)
 
         if output_norm == 'rmsnorm':
-            self.norm = RMSNorm(hidden_size=self.head_v_dim, elementwise_affine=elementwise_affine, eps=norm_eps)
+            self.norm = RMSNorm(hidden_size=self.head_v_dim, elementwise_affine=elementwise_affine,
+                                eps=norm_eps, dtype=torch.float32)
         elif output_norm == 'identity':
             self.norm = nn.Identity()
         else:
@@ -108,11 +123,25 @@ class LinearAttention(nn.Module):
         self.norm_q = norm_q
         self.norm_k = norm_k
 
-    def forward(self, x):
-        mode = self.mode
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = False,
+        output_attentions: bool | None = False,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, Cache | None]:
+        # Match other recurrent layers: use the recurrent kernel for decode/small chunks.
+        mode = 'fused_recurrent' if hidden_states.shape[1] <= 64 else self.mode
+        last_state = get_layer_cache(self, past_key_values)
+
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+
+        if attention_mask is not None:
+            v = v.mul(attention_mask[:, -v.shape[-2]:, None])
 
         q = rearrange(q, '... (h d) -> ... h d', d=self.head_k_dim)
         if self.num_kv_groups > 1:
@@ -130,19 +159,23 @@ class LinearAttention(nn.Module):
         if self.norm_k:
             k = k / (k.sum(-1, True) + 1e-4)
 
+        recurrent_state = last_state['recurrent_state'] if last_state is not None else None
         if mode == 'chunk':
             o, final_state = chunk_linear_attn(
                 q=q,
                 k=k,
                 v=v,
+                initial_state=recurrent_state,
+                output_final_state=use_cache,
                 normalize=self.do_feature_map_norm,
-                head_first=False
             )
         elif mode == 'fused_chunk':
             o, final_state = fused_chunk_linear_attn(
                 q=q,
                 k=k,
                 v=v,
+                initial_state=recurrent_state,
+                output_final_state=use_cache,
                 normalize=self.do_feature_map_norm,
             )
         elif mode == 'fused_recurrent':
@@ -150,11 +183,19 @@ class LinearAttention(nn.Module):
                 q=q,
                 k=k,
                 v=v,
+                initial_state=recurrent_state,
+                output_final_state=use_cache,
                 normalize=self.do_feature_map_norm,
             )
         else:
             raise NotImplementedError
+        update_layer_cache(
+            self,
+            past_key_values,
+            recurrent_state=final_state,
+            offset=q.shape[1],
+        )
         o = self.norm(o)
         o = rearrange(o, '... h d -> ... (h d)')
         o = self.o_proj(o)
-        return o
+        return o, None, past_key_values

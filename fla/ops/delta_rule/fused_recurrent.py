@@ -1,12 +1,13 @@
-# -*- coding: utf-8 -*-
-# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-
-from typing import Optional, Tuple
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import torch
 import triton
 import triton.language as tl
-from einops import rearrange
 
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
 from fla.utils import input_guard
@@ -15,7 +16,7 @@ from fla.utils import input_guard
 @triton.heuristics({
     'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
     'STORE_FINAL_STATE': lambda args: args['ht'] is not None,
-    'USE_OFFSETS': lambda args: args['offsets'] is not None
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.jit(do_not_specialize=['T'])
 def fused_recurrent_delta_rule_fwd_kernel(
@@ -27,7 +28,7 @@ def fused_recurrent_delta_rule_fwd_kernel(
     o,
     h0,
     ht,
-    offsets,
+    cu_seqlens,
     scale,
     T,
     B: tl.constexpr,
@@ -39,39 +40,27 @@ def fused_recurrent_delta_rule_fwd_kernel(
     USE_INITIAL_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
     IS_BETA_HEADWISE: tl.constexpr,
-    USE_OFFSETS: tl.constexpr,
-    HEAD_FIRST: tl.constexpr
+    IS_VARLEN: tl.constexpr,
 ):
     i_v, i_k, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_h = i_nh // H, i_nh % H
-    if USE_OFFSETS:
-        bos, eos = tl.load(offsets + i_n).to(tl.int64), tl.load(offsets + i_n + 1).to(tl.int64)
+    if IS_VARLEN:
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         all = T
         T = eos - bos
     else:
         bos, eos = i_n * T, i_n * T + T
         all = B * T
 
-    if HEAD_FIRST:
-        p_q = q + i_nh * T*K + i_k * BK + tl.arange(0, BK)
-        p_k = k + i_nh * T*K + i_k * BK + tl.arange(0, BK)
-        p_v = v + i_nh * T*V + i_v * BV + tl.arange(0, BV)
-        p_u = u + i_nh * T*V + i_v * BV + tl.arange(0, BV)
-        if IS_BETA_HEADWISE:
-            p_beta = beta + i_nh * T*V + i_v * BV + tl.arange(0, BV)
-        else:
-            p_beta = beta + i_nh * T
-        p_o = o + (i_k * B*H + i_nh) * T*V + i_v * BV + tl.arange(0, BV)
+    p_q = q + (bos * H + i_h) * K + i_k * BK + tl.arange(0, BK)
+    p_k = k + (bos * H + i_h) * K + i_k * BK + tl.arange(0, BK)
+    p_v = v + (bos * H + i_h) * V + i_v * BV + tl.arange(0, BV)
+    p_u = u + (bos * H + i_h) * V + i_v * BV + tl.arange(0, BV)
+    if IS_BETA_HEADWISE:
+        p_beta = beta + (bos * H + i_h) * V + i_v * BV + tl.arange(0, BV)
     else:
-        p_q = q + (bos * H + i_h) * K + i_k * BK + tl.arange(0, BK)
-        p_k = k + (bos * H + i_h) * K + i_k * BK + tl.arange(0, BK)
-        p_v = v + (bos * H + i_h) * V + i_v * BV + tl.arange(0, BV)
-        p_u = u + (bos * H + i_h) * V + i_v * BV + tl.arange(0, BV)
-        if IS_BETA_HEADWISE:
-            p_beta = beta + (bos * H + i_h) * V + i_v * BV + tl.arange(0, BV)
-        else:
-            p_beta = beta + bos * H + i_h
-        p_o = o + ((i_k * all + bos) * H + i_h) * V + i_v * BV + tl.arange(0, BV)
+        p_beta = beta + bos * H + i_h
+    p_o = o + ((i_k * all + bos) * H + i_h) * V + i_v * BV + tl.arange(0, BV)
 
     mask_k = (i_k * BK + tl.arange(0, BK)) < K
     mask_v = (i_v * BV + tl.arange(0, BV)) < V
@@ -99,12 +88,12 @@ def fused_recurrent_delta_rule_fwd_kernel(
         b_o = tl.sum(b_o, axis=1)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
-        p_q += K if HEAD_FIRST else H*K
-        p_k += K if HEAD_FIRST else H*K
-        p_o += V if HEAD_FIRST else H*V
-        p_v += V if HEAD_FIRST else H*V
-        p_u += V if HEAD_FIRST else H*V
-        p_beta += (1 if HEAD_FIRST else H) * (V if IS_BETA_HEADWISE else 1)
+        p_q += H*K
+        p_k += H*K
+        p_o += H*V
+        p_v += H*V
+        p_u += H*V
+        p_beta += H * (V if IS_BETA_HEADWISE else 1)
 
     if STORE_FINAL_STATE:
         p_ht = ht + i_nh * K * V + (i_k * BK + tl.arange(0, BK)[None, :]) * V + (i_v * BV + tl.arange(0, BV)[:, None])
@@ -114,7 +103,7 @@ def fused_recurrent_delta_rule_fwd_kernel(
 @triton.heuristics({
     'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
     'USE_FINAL_STATE_GRADIENT': lambda args: args['dht'] is not None,
-    'USE_OFFSETS': lambda args: args['offsets'] is not None
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.jit(do_not_specialize=['T'])
 def fused_recurrent_delta_rule_bwd_kernel(
@@ -130,7 +119,7 @@ def fused_recurrent_delta_rule_bwd_kernel(
     dk,
     dv,
     db,
-    offsets,
+    cu_seqlens,
     scale,
     B: tl.constexpr,
     T,
@@ -143,13 +132,12 @@ def fused_recurrent_delta_rule_bwd_kernel(
     IS_BETA_HEADWISE: tl.constexpr,  # whether beta is headwise vector or scalar
     USE_INITIAL_STATE: tl.constexpr,  # whether to use dh0
     USE_FINAL_STATE_GRADIENT: tl.constexpr,  # whether to use dht
-    USE_OFFSETS: tl.constexpr,
-    HEAD_FIRST: tl.constexpr
+    IS_VARLEN: tl.constexpr,
 ):
     i_v, i_k, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_h = i_nh // H, i_nh % H
-    if USE_OFFSETS:
-        bos, eos = tl.load(offsets + i_n).to(tl.int64), tl.load(offsets + i_n + 1).to(tl.int64)
+    if IS_VARLEN:
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         all = T
         T = eos - bos
     else:
@@ -159,32 +147,18 @@ def fused_recurrent_delta_rule_bwd_kernel(
     mask_k = i_k * BK + tl.arange(0, BK) < K
     mask_v = i_v * BV + tl.arange(0, BV) < V
 
-    if HEAD_FIRST:
-        p_q = q + i_nh * T*K + i_k * BK + tl.arange(0, BK) + (T - 1) * K
-        p_k = k + i_nh * T*K + i_k * BK + tl.arange(0, BK) + (T - 1) * K
-        p_v = v + i_nh * T*V + i_v * BV + tl.arange(0, BV) + (T - 1) * V
-        p_do = do + i_nh * T*V + i_v * BV + tl.arange(0, BV) + (T - 1) * V
-        p_dk = dk + (i_v * B*H + i_nh) * T*K + i_k * BK + tl.arange(0, BK) + (T - 1) * K
-        p_dv = dv + (i_k * B*H + i_nh) * T*V + i_v * BV + tl.arange(0, BV) + (T - 1) * V
-        if IS_BETA_HEADWISE:
-            p_beta = beta + i_nh * T*V + i_v * BV + tl.arange(0, BV) + (T - 1) * V
-            p_dbeta = db + (i_v * NK*B*H + i_k * B*H + i_nh) * T*V + tl.arange(0, BV) + (T - 1) * V
-        else:
-            p_beta = beta + i_nh * T + T - 1
-            p_dbeta = db + (i_v * B*H + i_nh) * T + T - 1
+    p_q = q + (bos * H + i_h) * K + i_k * BK + tl.arange(0, BK) + (T - 1) * H*K
+    p_k = k + (bos * H + i_h) * K + i_k * BK + tl.arange(0, BK) + (T - 1) * H*K
+    p_v = v + (bos * H + i_h) * V + i_v * BV + tl.arange(0, BV) + (T - 1) * H*V
+    p_do = do + (bos * H + i_h) * V + i_v * BV + tl.arange(0, BV) + (T - 1) * H*V
+    p_dk = dk + ((i_v * all + bos) * H + i_h) * K + i_k * BK + tl.arange(0, BK) + (T - 1) * H*K
+    p_dv = dv + ((i_k * all + bos) * H + i_h) * V + i_v * BV + tl.arange(0, BV) + (T - 1) * H*V
+    if IS_BETA_HEADWISE:
+        p_beta = beta + (bos + T - 1) * H*V + i_h * V + i_v * BV + tl.arange(0, BV)
+        p_dbeta = db + ((i_v * NK + i_k) * all + bos + T - 1) * H*V + i_h * V + tl.arange(0, BV)
     else:
-        p_q = q + (bos * H + i_h) * K + i_k * BK + tl.arange(0, BK) + (T - 1) * H*K
-        p_k = k + (bos * H + i_h) * K + i_k * BK + tl.arange(0, BK) + (T - 1) * H*K
-        p_v = v + (bos * H + i_h) * V + i_v * BV + tl.arange(0, BV) + (T - 1) * H*V
-        p_do = do + (bos * H + i_h) * V + i_v * BV + tl.arange(0, BV) + (T - 1) * H*V
-        p_dk = dk + ((i_v * all + bos) * H + i_h) * K + i_k * BK + tl.arange(0, BK) + (T - 1) * H*K
-        p_dv = dv + ((i_k * all + bos) * H + i_h) * V + i_v * BV + tl.arange(0, BV) + (T - 1) * H*V
-        if IS_BETA_HEADWISE:
-            p_beta = beta + (bos + T - 1) * H*V + i_h * V + i_v * BV + tl.arange(0, BV)
-            p_dbeta = db + ((i_v * NK + i_k) * all + bos + T - 1) * H*V + i_h * V + tl.arange(0, BV)
-        else:
-            p_beta = beta + (bos + T - 1) * H + i_h
-            p_dbeta = db + (i_v * all + bos + T - 1) * H + i_h
+        p_beta = beta + (bos + T - 1) * H + i_h
+        p_dbeta = db + (i_v * all + bos + T - 1) * H + i_h
 
     b_dh = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_FINAL_STATE_GRADIENT:
@@ -216,14 +190,14 @@ def fused_recurrent_delta_rule_bwd_kernel(
 
         b_dh -= b_k[:, None] * b_dv[None, :]
 
-        p_q -= K if HEAD_FIRST else H*K
-        p_k -= K if HEAD_FIRST else H*K
-        p_v -= V if HEAD_FIRST else H*V
-        p_do -= V if HEAD_FIRST else H*V
-        p_dk -= K if HEAD_FIRST else H*K
-        p_dv -= V if HEAD_FIRST else H*V
-        p_dbeta -= (1 if HEAD_FIRST else H) * (V if IS_BETA_HEADWISE else 1)
-        p_beta -= (1 if HEAD_FIRST else H) * (V if IS_BETA_HEADWISE else 1)
+        p_q -= H*K
+        p_k -= H*K
+        p_v -= H*V
+        p_do -= H*V
+        p_dk -= H*K
+        p_dv -= H*V
+        p_dbeta -= H * (V if IS_BETA_HEADWISE else 1)
+        p_beta -= H * (V if IS_BETA_HEADWISE else 1)
 
     if USE_INITIAL_STATE:
         p_dh0 = dh0 + i_nh * K * V + (i_k * BK + tl.arange(0, BK)[:, None]) * V + (i_v * BV + tl.arange(0, BV)[None, :])
@@ -233,30 +207,17 @@ def fused_recurrent_delta_rule_bwd_kernel(
 
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
 
-    if HEAD_FIRST:
-        p_q = q + i_nh * T*K + i_k * BK + tl.arange(0, BK)
-        p_k = k + i_nh * T*K + i_k * BK + tl.arange(0, BK)
-        p_v = v + i_nh * T*V + i_v * BV + tl.arange(0, BV)
-        if IS_BETA_HEADWISE:
-            p_beta = beta + i_nh * T*V + i_v * BV + tl.arange(0, BV)
-        else:
-            p_beta = beta + i_nh * T
-        p_do = do + i_nh * T*V + i_v * BV + tl.arange(0, BV)
-        p_dq = dq + (i_v * B*H + i_nh) * T*K + i_k * BK + tl.arange(0, BK)
-        p_dk = dk + (i_v * B*H + i_nh) * T*K + i_k * BK + tl.arange(0, BK)
-        p_dv = dv + (i_k * B*H + i_nh) * T*V + i_v * BV + tl.arange(0, BV)
+    p_q = q + (bos * H + i_h) * K + i_k * BK + tl.arange(0, BK)
+    p_k = k + (bos * H + i_h) * K + i_k * BK + tl.arange(0, BK)
+    p_v = v + (bos * H + i_h) * V + i_v * BV + tl.arange(0, BV)
+    if IS_BETA_HEADWISE:
+        p_beta = beta + (bos * H + i_h) * V + i_v * BV + tl.arange(0, BV)
     else:
-        p_q = q + (bos * H + i_h) * K + i_k * BK + tl.arange(0, BK)
-        p_k = k + (bos * H + i_h) * K + i_k * BK + tl.arange(0, BK)
-        p_v = v + (bos * H + i_h) * V + i_v * BV + tl.arange(0, BV)
-        if IS_BETA_HEADWISE:
-            p_beta = beta + (bos * H + i_h) * V + i_v * BV + tl.arange(0, BV)
-        else:
-            p_beta = beta + bos * H + i_h
-        p_do = do + (bos * H + i_h) * V + i_v * BV + tl.arange(0, BV)
-        p_dq = dq + ((i_v * all + bos) * H + i_h) * K + i_k * BK + tl.arange(0, BK)
-        p_dk = dk + ((i_v * all + bos) * H + i_h) * K + i_k * BK + tl.arange(0, BK)
-        p_dv = dv + ((i_k * all + bos) * H + i_h) * V + i_v * BV + tl.arange(0, BV)
+        p_beta = beta + bos * H + i_h
+    p_do = do + (bos * H + i_h) * V + i_v * BV + tl.arange(0, BV)
+    p_dq = dq + ((i_v * all + bos) * H + i_h) * K + i_k * BK + tl.arange(0, BK)
+    p_dk = dk + ((i_v * all + bos) * H + i_h) * K + i_k * BK + tl.arange(0, BK)
+    p_dv = dv + ((i_k * all + bos) * H + i_h) * V + i_v * BV + tl.arange(0, BV)
 
     if USE_INITIAL_STATE:
         mask_h = mask_k[:, None] & mask_v[None, :]
@@ -283,13 +244,13 @@ def fused_recurrent_delta_rule_bwd_kernel(
         d_q = tl.sum(b_dq, axis=1) * scale
         tl.store(p_dq, d_q.to(p_dq.dtype.element_ty), mask=mask_k)
 
-        p_k += K if HEAD_FIRST else H*K
-        p_v += V if HEAD_FIRST else H*V
-        p_do += V if HEAD_FIRST else H*V
-        p_dq += K if HEAD_FIRST else H*K
-        p_dk += K if HEAD_FIRST else H*K
-        p_dv += V if HEAD_FIRST else H*V
-        p_beta += (1 if HEAD_FIRST else H) * (V if IS_BETA_HEADWISE else 1)
+        p_k += H*K
+        p_v += H*V
+        p_do += H*V
+        p_dq += H*K
+        p_dk += H*K
+        p_dv += H*V
+        p_beta += H * (V if IS_BETA_HEADWISE else 1)
 
 
 def fused_recurrent_delta_rule_fwd(
@@ -300,14 +261,10 @@ def fused_recurrent_delta_rule_fwd(
     scale: float,
     initial_state: torch.Tensor,
     output_final_state: bool,
-    offsets: Optional[torch.LongTensor] = None,
-    head_first: bool = True
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    if head_first:
-        B, H, T, K, V = *k.shape, v.shape[-1]
-    else:
-        B, T, H, K, V = *k.shape, v.shape[-1]
-    N = B if offsets is None else len(offsets) - 1
+    cu_seqlens: torch.LongTensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    B, T, H, K, V = *k.shape, v.shape[-1]
+    N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 8)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
@@ -331,7 +288,7 @@ def fused_recurrent_delta_rule_fwd(
         o,
         initial_state,
         final_state,
-        offsets,
+        cu_seqlens,
         scale,
         T=T,
         B=B,
@@ -341,7 +298,6 @@ def fused_recurrent_delta_rule_fwd(
         BK=BK,
         BV=BV,
         IS_BETA_HEADWISE=beta.ndim == v.ndim,
-        HEAD_FIRST=head_first,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -358,14 +314,10 @@ def fused_recurrent_delta_rule_bwd(
     do: torch.Tensor,
     scale: float,
     initial_state: torch.Tensor,
-    offsets: Optional[torch.LongTensor] = None,
-    head_first: bool = True
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if head_first:
-        B, H, T, K, V = *k.shape, v.shape[-1]
-    else:
-        B, T, H, K, V = *k.shape, v.shape[-1]
-    N = B if offsets is None else len(offsets) - 1
+    cu_seqlens: torch.LongTensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    B, T, H, K, V = *k.shape, v.shape[-1]
+    N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
@@ -378,9 +330,9 @@ def fused_recurrent_delta_rule_bwd(
     dk = q.new_empty(NV, *k.shape)
     dv = q.new_empty(NK, *v.shape)
     if beta_vector:
-        db = q.new_empty(NV, NK, B, H, T, V) if head_first else q.new_empty(NV, NK, B, T, H, V)
+        db = q.new_empty(NV, NK, B, T, H, V)
     else:
-        db = q.new_empty(NV, B, H, T) if head_first else q.new_empty(NV, B, T, H)
+        db = q.new_empty(NV, B, T, H)
     grid = (NV, NK, N * H)
 
     if initial_state is not None and initial_state.requires_grad:
@@ -401,7 +353,7 @@ def fused_recurrent_delta_rule_bwd(
         dk,
         dv,
         db,
-        offsets,
+        cu_seqlens,
         scale,
         T=T,
         B=B,
@@ -412,9 +364,8 @@ def fused_recurrent_delta_rule_bwd(
         BV=BV,
         NK=NK,
         IS_BETA_HEADWISE=beta_vector,
-        HEAD_FIRST=head_first,
         num_warps=num_warps,
-        num_stages=num_stages
+        num_stages=num_stages,
     )
     dq = dq.sum(0)
     dk = dk.sum(0)
@@ -437,16 +388,14 @@ class FusedRecurrentFunction(torch.autograd.Function):
         scale: float,
         initial_state: torch.Tensor,
         output_final_state: bool,
-        offsets: Optional[torch.LongTensor] = None,
-        head_first: bool = True,
-        use_qk_l2norm_in_kernel: bool = False
+        use_qk_l2norm_in_kernel: bool = False,
+        cu_seqlens: torch.LongTensor | None = None,
     ):
-        q_orig = q
-        k_orig = k
-
         if use_qk_l2norm_in_kernel:
-            q = l2norm_fwd(q)
-            k = l2norm_fwd(k)
+            q, q_rstd = l2norm_fwd(q)
+            k, k_rstd = l2norm_fwd(k)
+        else:
+            q_rstd, k_rstd = None, None
 
         o, u, final_state = fused_recurrent_delta_rule_fwd(
             q=q,
@@ -456,24 +405,19 @@ class FusedRecurrentFunction(torch.autograd.Function):
             scale=scale,
             initial_state=initial_state,
             output_final_state=output_final_state,
-            offsets=offsets,
-            head_first=head_first
+            cu_seqlens=cu_seqlens,
         )
 
-        ctx.save_for_backward(q_orig, k_orig, u, beta, initial_state)
+        ctx.save_for_backward(q, q_rstd, k, k_rstd, u, beta, initial_state)
         ctx.scale = scale
-        ctx.offsets = offsets
-        ctx.head_first = head_first
+        ctx.cu_seqlens = cu_seqlens
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
         return o, final_state
 
     @staticmethod
     @input_guard
     def backward(ctx, do, dht):
-        q, k, v, beta, initial_state = ctx.saved_tensors
-        if ctx.use_qk_l2norm_in_kernel:
-            q, q_orig = l2norm_fwd(q), q
-            k, k_orig = l2norm_fwd(k), k
+        q, q_rstd, k, k_rstd, v, beta, initial_state = ctx.saved_tensors
         dq, dk, dv, db, dh0 = fused_recurrent_delta_rule_bwd(
             q=q,
             k=k,
@@ -483,12 +427,12 @@ class FusedRecurrentFunction(torch.autograd.Function):
             do=do,
             scale=ctx.scale,
             initial_state=initial_state,
-            offsets=ctx.offsets,
-            head_first=ctx.head_first
+            cu_seqlens=ctx.cu_seqlens,
         )
         if ctx.use_qk_l2norm_in_kernel:
-            dq, dk = l2norm_bwd(q_orig, dq), l2norm_bwd(k_orig, dk)
-        return dq.to(q), dk.to(k), dv.to(v), db.to(beta), None, dh0, None, None, None, None
+            dq = l2norm_bwd(q, q_rstd, dq)
+            dk = l2norm_bwd(k, k_rstd, dk)
+        return dq.to(q), dk.to(k), dv.to(v), db.to(beta), None, dh0, None, None, None
 
 
 @torch.compiler.disable
@@ -500,21 +444,20 @@ def fused_recurrent_delta_rule(
     scale: float = None,
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    head_first: bool = True,
-    use_qk_l2norm_in_kernel: bool = False
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    use_qk_l2norm_in_kernel: bool = False,
+    cu_seqlens: torch.LongTensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
     Args:
         q (torch.Tensor):
-            queries of shape `[B, T, H, K]` if `head_first=False` else `[B, H, T, K]`.
+            queries of shape `[B, T, H, K]`.
         k (torch.Tensor):
-            keys of shape `[B, T, H, K]` if `head_first=False` else `[B, H, T, K]`.
+            keys of shape `[B, T, H, K]`.
         v (torch.Tensor):
-            values of shape `[B, T, H, V]` if `head_first=False` else `[B, H, T, V]`.
+            values of shape `[B, T, H, V]`.
         beta (torch.Tensor):
-             betas of shape `[B, T, H]` if `head_first=False` else `(B, H, T)`.
-        scale (Optional[int]):
+            betas of shape `[B, T, H]`.
+        scale (Optional[float]):
             Scale factor for the RetNet attention scores.
             If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
         initial_state (Optional[torch.Tensor]):
@@ -523,16 +466,15 @@ def fused_recurrent_delta_rule(
             Default: `None`.
         output_final_state (Optional[bool]):
             Whether to output the final state of shape `[N, H, K, V]`. Default: `False`.
+        use_qk_l2norm_in_kernel (Optional[bool]):
+            Whether to use L2 normalization in the kernel. Default: `False`.
         cu_seqlens (torch.LongTensor):
             Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
             consistent with the FlashAttention API.
-        head_first (Optional[bool]):
-            Whether the inputs are in the head-first format, which is not supported for variable-length inputs.
-            Default: `False`.
 
     Returns:
         o (torch.Tensor):
-            Outputs of shape `[B, T, H, V]` if `head_first=False` else `[B, H, T, V]`.
+            Outputs of shape `[B, T, H, V]`.
         final_state (torch.Tensor):
             Final state of shape `[N, H, K, V]` if `output_final_state=True` else `None`.
 
@@ -557,29 +499,23 @@ def fused_recurrent_delta_rule(
         >>> q, k, v, beta = map(lambda x: rearrange(x, 'b t ... -> 1 (b t) ...'), (q, k, v, beta))
         # for a batch with 4 sequences, `cu_seqlens` with 5 start/end positions are expected
         >>> cu_seqlens = q.new_tensor([0, 2048, 4096, 6144, 8192], dtype=torch.long)
-        >>> o_var, ht_var = fused_recurrent_delta_rule(
+        >>> o, ht = fused_recurrent_delta_rule(
             q, k, v, beta,
             initial_state=h0,
             output_final_state=True,
             cu_seqlens=cu_seqlens
         )
-        >>> assert o.allclose(o_var.view(o.shape))
-        >>> assert ht.allclose(ht_var)
     """
     if cu_seqlens is not None:
         if q.shape[0] != 1:
             raise ValueError(
                 f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
-                f"Please flatten variable-length inputs before processing."
-            )
-        if head_first:
-            raise RuntimeError(
-                "Sequences with variable lengths are not supported for head-first mode"
+                f"Please flatten variable-length inputs before processing.",
             )
         if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
             raise ValueError(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
-                f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}."
+                f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}.",
             )
     if scale is None:
         scale = k.shape[-1] ** -0.5
@@ -587,9 +523,6 @@ def fused_recurrent_delta_rule(
         assert scale > 0, "scale must be positive"
     if beta is None:
         beta = torch.ones_like(q[..., 0])
-    if head_first:
-        q, k, v = map(lambda x: rearrange(x, 'b h t d -> b t h d'), (q, k, v))
-        beta = rearrange(beta, 'b h t -> b t h')
     o, final_state = FusedRecurrentFunction.apply(
         q,
         k,
@@ -598,10 +531,7 @@ def fused_recurrent_delta_rule(
         scale,
         initial_state,
         output_final_state,
+        use_qk_l2norm_in_kernel,
         cu_seqlens,
-        False,
-        use_qk_l2norm_in_kernel
     )
-    if head_first:
-        o = rearrange(o, 'b t h v -> b h t v')
     return o, final_state
